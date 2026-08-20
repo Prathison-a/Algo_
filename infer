@@ -1,0 +1,55 @@
+# engine/inference_engine.py
+
+from data.ftp_loader import load_ohlcv
+from engine.tcn_predictor import TCNPredictor
+from engine.signal_logic import SignalEngine
+
+
+class InferenceEngine:
+
+    def __init__(self):
+        self.predictors = {}
+        self.signal_engine = SignalEngine()
+
+    def load_data(self, ticker):
+
+        print("ENGINE LOAD_DATA CALLED")
+
+        df = load_ohlcv(ticker)
+
+        # Make column names lowercase
+        df.columns = [c.lower() for c in df.columns]
+
+        # Make sure candles are chronological
+        df.sort_values("datetime", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+
+        return df
+
+    def get_predictor(self, ticker):
+
+        ticker = ticker.upper()
+
+        # Load predictor only once
+        if ticker not in self.predictors:
+            print(f"Loading TCN predictor for {ticker}")
+
+            self.predictors[ticker] = TCNPredictor(ticker)
+
+        return self.predictors[ticker]
+
+    def predict_signal(self, ticker):
+
+        # 1. Load real market data
+        df = self.load_data(ticker)
+
+        # 2. Get trained TCN predictor
+        predictor = self.get_predictor(ticker)
+
+        # 3. Get the TCN's direct prediction
+        prediction = predictor.predict(df)
+
+        # 4. Validate and normalize the TCN prediction
+        result = self.signal_engine.generate(prediction)
+
+        return result
