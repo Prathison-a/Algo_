@@ -1,0 +1,189 @@
+"""
+signal_logic.py
+
+Thin signal-processing / validation layer that sits between the TCN
+classifier and app.py.
+
+Current architecture
+---------------------
+    TCN_Training.py
+        -> trained TCN classifier
+        -> tcn_predictor.py            (predictor.predict(df))
+        -> TCN prediction result       (signal, confidence, probabilities, ...)
+        -> signal_logic.py             (THIS FILE)
+        -> normalized final signal payload
+        -> inference_engine.py
+        -> app.py
+        -> frontend
+
+Responsibility of this module (and ONLY this module)
+------------------------------------------------------
+The TCN already predicts BUY / HOLD / SELL directly (it is a 3-class
+classifier trained on OHLCV + EMA9/EMA20/EMA50/VWAP/RSI14/ATR14/MACD).
+This module does NOT re-derive a trading decision. It simply:
+
+    1. Validates that the prediction result coming out of
+       TCNPredictor.predict(df) contains a usable signal.
+    2. Validates that the signal is one of BUY / SELL / HOLD.
+    3. Preserves the model's confidence, probabilities, and any other
+       metadata (symbol, sequence_length, indicators, features, etc.)
+       exactly as the TCN produced them.
+    4. Returns a clean, normalized dict that app.py can consume.
+
+This module NEVER:
+    - trains or calls the TCN
+    - predicts a future price / next open
+    - computes a predicted move percentage
+    - applies EMA9/EMA20 crossover rules
+    - applies its own RSI/MACD/VWAP rules
+    - overrides or second-guesses the TCN's BUY/SELL/HOLD decision
+
+The TCN's prediction is the single source of truth. This file exists
+purely to validate and repackage that prediction, not to make one.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+from enum import Enum
+
+
+class Signal(str, Enum):
+    """The three possible outputs of the TCN classifier."""
+
+    BUY = "BUY"
+    SELL = "SELL"
+    HOLD = "HOLD"
+
+
+VALID_SIGNALS = {s.value for s in Signal}
+
+
+class InvalidPredictionError(ValueError):
+    """
+    Raised when the TCN prediction result passed into SignalEngine is
+    missing, malformed, or contains a signal outside BUY/SELL/HOLD.
+    """
+
+
+# Metadata fields we know about and will pass through untouched if the
+# predictor included them. This list is informational only -- any other
+# field on the prediction result is preserved too (see generate() below),
+# so a future addition to tcn_predictor.py's output is never silently
+# dropped.
+KNOWN_METADATA_FIELDS = (
+    "symbol",
+    "sequence_length",
+    "indicators",
+    "features",
+)
+
+
+class SignalEngine:
+    """
+    Validates and normalizes the result of TCNPredictor.predict(df).
+
+    Usage:
+        from engine.signal_logic import SignalEngine
+
+        engine = SignalEngine()
+        prediction_result = predictor.predict(df)   # from tcn_predictor.py
+        payload = engine.generate(prediction_result)
+        # payload is now safe to hand to inference_engine.py / app.py
+    """
+
+    def generate(self, prediction_result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Validate the TCN's prediction result and return a normalized
+        payload. Does NOT change the model's BUY/SELL/HOLD decision.
+
+        Expected shape of `prediction_result` (as produced by
+        TCNPredictor.predict(df)):
+            {
+                "signal": "BUY" | "SELL" | "HOLD",
+                "confidence": float,
+                "probabilities": {...},
+                "symbol": ...,
+                "sequence_length": ...,
+                "indicators": ...,
+                "features": ...,
+                ... any other fields the predictor includes ...
+            }
+
+        Raises:
+            InvalidPredictionError: if the result is missing, not a dict,
+                missing a 'signal' field, or the signal isn't one of
+                BUY / SELL / HOLD.
+        """
+        if prediction_result is None:
+            raise InvalidPredictionError(
+                "No prediction result was provided (got None). Make sure "
+                "TCNPredictor.predict(df) ran successfully before calling "
+                "SignalEngine.generate()."
+            )
+
+        if not isinstance(prediction_result, dict):
+            raise InvalidPredictionError(
+                "prediction_result must be a dict returned by "
+                f"TCNPredictor.predict(df), got {type(prediction_result).__name__} instead."
+            )
+
+        raw_signal = prediction_result.get("signal")
+        if raw_signal is None or (isinstance(raw_signal, str) and not raw_signal.strip()):
+            raise InvalidPredictionError(
+                "prediction_result is missing a 'signal' field. Expected the "
+                "TCN predictor to return one of: BUY, SELL, HOLD."
+            )
+
+        signal_str = str(raw_signal).strip().upper()
+        if signal_str not in VALID_SIGNALS:
+            raise InvalidPredictionError(
+                f"Invalid signal '{raw_signal}' from TCN prediction. "
+                f"Expected one of {sorted(VALID_SIGNALS)}."
+            )
+
+        # Build the normalized payload. We preserve values as-is -- we
+        # never compute or invent a signal, confidence, or probability.
+        payload: Dict[str, Any] = {
+            "signal": signal_str,
+            "confidence": prediction_result.get("confidence"),
+            "probabilities": prediction_result.get("probabilities"),
+        }
+
+        for field_name in KNOWN_METADATA_FIELDS:
+            if field_name in prediction_result:
+                payload[field_name] = prediction_result[field_name]
+
+        # Pass through any additional fields the predictor included that
+        # aren't in KNOWN_METADATA_FIELDS, so nothing the TCN pipeline
+        # produces gets silently dropped.
+        for key, value in prediction_result.items():
+            if key not in payload:
+                payload[key] = value
+
+        return payload
+
+
+if __name__ == "__main__":
+    # Minimal smoke test using a fake TCN prediction result. This block
+    # only sanity-checks validation/passthrough in isolation -- it is
+    # never used by the real pipeline.
+    fake_prediction = {
+        "signal": "BUY",
+        "confidence": 0.87,
+        "probabilities": {"SELL": 0.05, "HOLD": 0.08, "BUY": 0.87},
+        "symbol": "AAPL",
+        "sequence_length": 60,
+        "indicators": ["EMA9", "EMA20", "EMA50", "VWAP", "RSI14", "ATR14", "MACD"],
+        "features": ["open", "high", "low", "close", "volume"],
+    }
+
+    engine = SignalEngine()
+    result = engine.generate(fake_prediction)
+    print(result)
+
+    try:
+        engine.generate({"confidence": 0.5})
+    except InvalidPredictionError as e:
+        print(f"Correctly rejected bad input: {e}")
