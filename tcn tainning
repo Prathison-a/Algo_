@@ -1,0 +1,1164 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+from pathlib import Path
+import random
+from ftplib import FTP
+from io import BytesIO
+
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+)
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+
+# =========================================================
+# REPRODUCIBILITY
+# =========================================================
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"\nUsing Device: {DEVICE}")
+
+
+# =========================================================
+# FTP CONFIG
+# =========================================================
+
+FTP_HOST = "ftp.cavedspace.com"
+FTP_USER = "ftpuser"
+FTP_PASS = "TestUser01!!"
+FTP_ROOT = "/Backup"
+
+DEFAULT_SYMBOL = "SPY"
+
+
+# =========================================================
+# TRAINING CONFIG
+# =========================================================
+
+SEQUENCE_LENGTH = 60
+BATCH_SIZE = 128
+EPOCHS = 50
+LEARNING_RATE = 0.0001
+WEIGHT_DECAY = 1e-6
+PATIENCE = 10
+DROPOUT_RATE = 0.2
+
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+
+# =========================================================
+# SIGNAL / CLASSIFICATION CONFIG
+# =========================================================
+
+# The model predicts BUY / HOLD / SELL directly. These thresholds
+# decide how each historical training LABEL is created from the
+# future candle's open relative to the current candle's close. They
+# are NOT used at inference time -- the trained classifier makes the
+# call on its own once it is trained.
+BUY_THRESHOLD_PCT = 0.20
+SELL_THRESHOLD_PCT = -0.20
+
+# Class index mapping used everywhere in this file (labels, model
+# output logits, checkpoints, printed metrics).
+SELL = 0
+HOLD = 1
+BUY = 2
+
+SIGNAL_CLASSES = {
+    SELL: "SELL",
+    HOLD: "HOLD",
+    BUY: "BUY",
+}
+
+# Expanded indicator set for this pipeline, per the architecture:
+#   OHLCV + EMA9 + EMA20 + EMA50 + VWAP + RSI14 + ATR14 + MACD
+#     -> 60-candle sequence -> TCN -> BUY / HOLD / SELL + confidence
+#
+# "Volume" is not listed as a separate indicator here because it is
+# already part of BASE_FEATURES below (every bar's raw volume is
+# always included as an input column, indicator selection or not).
+DEFAULT_INDICATORS = [
+    "EMA9",
+    "EMA20",
+    "EMA50",
+    "VWAP",
+    "RSI14",
+    "ATR14",
+    "MACD",
+]
+
+# Mandatory base OHLCV columns. Always included first, regardless of
+# which indicators are selected. Keeping them fixed at indices [0..4]
+# keeps the column order predictable for any downstream inference code.
+BASE_FEATURES = [
+    "high",
+    "low",
+    "close",
+    "volume",
+    "open",
+]
+
+# Maps each selectable indicator name -> the dataframe column(s) it
+# produces.
+INDICATOR_COLUMN_MAP = {
+    "EMA9":  ["ema9"],
+    "EMA20": ["ema20"],
+    "EMA50": ["ema50"],
+    "VWAP":  ["vwap"],
+    "RSI14": ["rsi14"],
+    "ATR14": ["atr14"],
+    "MACD":  ["macd_line", "macd_signal", "macd_hist"],
+}
+
+# The model now predicts exactly ONE target: the trading signal class
+# (SELL = 0, HOLD = 1, BUY = 2). This replaces the old regression
+# target "target_next_open". The signal itself -- not a separate
+# rule-based engine -- is what the trading system acts on.
+TARGET_COLUMN = "target_signal"
+
+feature_scaler = StandardScaler()
+# NOTE: there is intentionally no target scaler anymore. Classification
+# labels are class indices (0/1/2), not continuous values, so they must
+# never be passed through StandardScaler.
+
+
+# =========================================================
+# INDICATOR NAME NORMALIZATION
+# =========================================================
+
+def normalize_indicator_name(name):
+    """
+    Turns whatever is passed in ("ema9", "EMA 9", etc.) into the
+    exact canonical key used in INDICATOR_COLUMN_MAP / INDICATOR_REGISTRY.
+    """
+    cleaned = str(name).strip().upper()
+    cleaned = cleaned.replace("_", " ").replace("-", " ")
+    cleaned = " ".join(cleaned.split())          # collapse repeated spaces
+    no_space = cleaned.replace(" ", "")
+
+    for canonical in INDICATOR_COLUMN_MAP.keys():
+        if canonical.upper().replace(" ", "") == no_space:
+            return canonical
+
+    raise ValueError(
+        f"Unknown indicator '{name}'. This pipeline only supports: "
+        f"{list(INDICATOR_COLUMN_MAP.keys())}"
+    )
+
+
+def normalize_indicator_list(indicators):
+    """
+    Normalizes a whole list of indicator names and removes duplicates
+    while preserving the order they were given in.
+    """
+    normalized = []
+    for raw_name in indicators:
+        canonical = normalize_indicator_name(raw_name)
+        if canonical not in normalized:
+            normalized.append(canonical)
+    return normalized
+
+
+# =========================================================
+# INDICATORS (EMA9 / EMA20 / EMA50 / VWAP / RSI14 / ATR14 / MACD)
+# =========================================================
+
+def compute_rsi(close, period=RSI_PERIOD):
+    delta = close.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        min_periods=period,
+        adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        min_periods=period,
+        adjust=False
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    return 100 - (100 / (1 + rs))
+
+
+def compute_atr(dataframe, period=ATR_PERIOD):
+    """
+    Average True Range: volatility measure derived from the True Range
+    (max of high-low, |high-prev_close|, |low-prev_close|), smoothed
+    with Wilder's EWM (alpha = 1/period).
+    """
+    high_low = dataframe["high"] - dataframe["low"]
+    high_close = (dataframe["high"] - dataframe["close"].shift()).abs()
+    low_close = (dataframe["low"] - dataframe["close"].shift()).abs()
+
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+
+    return true_range.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def compute_vwap(dataframe):
+    """
+    Volume-Weighted Average Price, cumulative over the full series:
+    cumsum(typical_price * volume) / cumsum(volume), where
+    typical_price = (high + low + close) / 3.
+    """
+    typical_price = (dataframe["high"] + dataframe["low"] + dataframe["close"]) / 3
+    cumulative_pv = (typical_price * dataframe["volume"]).cumsum()
+    cumulative_volume = dataframe["volume"].cumsum().replace(0, np.nan)
+
+    return cumulative_pv / cumulative_volume
+
+
+def compute_macd(dataframe, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
+    ema_fast = dataframe["close"].ewm(span=fast, adjust=False).mean()
+    ema_slow = dataframe["close"].ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+
+    return pd.DataFrame({
+        "macd_line":   macd_line,
+        "macd_signal": signal_line,
+        "macd_hist":   macd_line - signal_line,
+    })
+
+
+# Registry: indicator name -> function that computes it from raw OHLCV.
+# add_indicators() below only ever calls entries that were selected,
+# so no unused indicator ever gets computed.
+INDICATOR_REGISTRY = {
+
+    "EMA9": lambda df: (
+        df["close"].ewm(span=9, adjust=False).mean()
+    ),
+
+    "EMA20": lambda df: (
+        df["close"].ewm(span=20, adjust=False).mean()
+    ),
+
+    "EMA50": lambda df: (
+        df["close"].ewm(span=50, adjust=False).mean()
+    ),
+
+    "VWAP": lambda df: (
+        compute_vwap(df)
+    ),
+
+    "RSI14": lambda df: (
+        compute_rsi(df["close"], period=RSI_PERIOD)
+    ),
+
+    "ATR14": lambda df: (
+        compute_atr(df, period=ATR_PERIOD)
+    ),
+
+    "MACD": lambda df: (
+        compute_macd(df, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
+    ),
+}
+
+
+def add_indicators(dataframe, indicators):
+    """
+    Computes ONLY the indicators requested (already normalized to
+    their canonical names) and appends their column(s) to the
+    dataframe. Nothing else is ever calculated here.
+    """
+    dataframe = dataframe.copy()
+
+    for name in indicators:
+        if name not in INDICATOR_REGISTRY:
+            raise ValueError(f"Unknown indicator: {name}")
+
+        result = INDICATOR_REGISTRY[name](dataframe)
+
+        if isinstance(result, pd.DataFrame):
+            for col in result.columns:
+                dataframe[col] = result[col]
+        else:
+            dataframe[INDICATOR_COLUMN_MAP[name][0]] = result
+
+    return dataframe
+
+
+def resolve_indicator_columns(indicators):
+    """
+    Returns the flat list of generated indicator column names for the
+    selected indicators, in selection order. E.g. for
+    ["EMA9", "EMA20", "EMA50", "VWAP", "RSI14", "ATR14", "MACD"] ->
+    ["ema9", "ema20", "ema50", "vwap", "rsi14", "atr14",
+     "macd_line", "macd_signal", "macd_hist"]
+    """
+    columns = []
+    for name in indicators:
+        columns.extend(INDICATOR_COLUMN_MAP[name])
+    return columns
+
+
+def resolve_feature_columns(indicators):
+    """
+    FINAL_FEATURES = BASE_FEATURES + Selected_Indicator_Columns
+    """
+    return list(BASE_FEATURES) + resolve_indicator_columns(indicators)
+
+
+# =========================================================
+# TRAINING LABEL: BUY / HOLD / SELL
+# =========================================================
+
+def add_targets(dataframe):
+    """
+    Builds the classification label "target_signal" from FUTURE price
+    movement -- the next candle's open relative to the current
+    candle's close. This future information is used ONLY to build the
+    historical label column here. It is never added as a model INPUT
+    feature, so the 60-candle input sequence the model actually sees
+    only ever contains information that was available at that time.
+
+    Label rule:
+        future_move_pct >= BUY_THRESHOLD_PCT   -> BUY  (2)
+        future_move_pct <= SELL_THRESHOLD_PCT  -> SELL (0)
+        otherwise                              -> HOLD (1)
+    """
+    dataframe = dataframe.copy()
+
+    future_open = dataframe["open"].shift(-1)
+
+    future_move_pct = (
+        (future_open - dataframe["close"])
+        / dataframe["close"]
+    ) * 100
+
+    conditions_buy = future_move_pct >= BUY_THRESHOLD_PCT
+    conditions_sell = future_move_pct <= SELL_THRESHOLD_PCT
+
+    # Default everything to HOLD, then overwrite with BUY / SELL
+    # wherever the thresholds say so.
+    signal = pd.Series(HOLD, index=dataframe.index, dtype="float")
+    signal[conditions_buy] = BUY
+    signal[conditions_sell] = SELL
+
+    # Rows where future_move_pct is NaN (the very last row, since
+    # shift(-1) has nothing to shift in) must stay NaN so dropna()
+    # removes them -- they have no valid future label.
+    signal[future_move_pct.isna()] = np.nan
+
+    dataframe[TARGET_COLUMN] = signal
+
+    return dataframe
+
+
+# =========================================================
+# FTP DATA LOADING
+# =========================================================
+
+def get_file_name(symbol):
+    return f"OHLCV{symbol}.txt"
+
+
+def connect_ftp():
+    ftp = FTP(
+        FTP_HOST,
+        timeout=60
+    )
+
+    ftp.login(
+        user=FTP_USER,
+        passwd=FTP_PASS
+    )
+
+    ftp.set_pasv(True)
+
+    return ftp
+
+
+def load_symbol_data(symbol):
+    first_ftp = connect_ftp()
+    first_ftp.cwd(FTP_ROOT)
+
+    folders = first_ftp.nlst()
+
+    try:
+        first_ftp.quit()
+    except:
+        first_ftp.close()
+
+    date_folders = sorted([
+        folder for folder in folders
+        if folder.startswith("202")
+    ])
+
+    usable_folders = date_folders[:-1]
+    all_dataframes = []
+
+    for folder in usable_folders:
+        ftp = None
+
+        try:
+            print(f"\nLoading {folder}")
+
+            ftp = connect_ftp()
+
+            folder_path = f"{FTP_ROOT}/{folder}/{symbol}"
+            file_name = get_file_name(symbol)
+            file_path = f"{folder_path}/{file_name}"
+
+            buffer = BytesIO()
+
+            ftp.retrbinary(
+                f"RETR {file_path}",
+                buffer.write
+            )
+
+            buffer.seek(0)
+
+            dataframe = pd.read_csv(buffer)
+            all_dataframes.append(dataframe)
+
+            print("Loaded Successfully")
+
+        except Exception as error:
+            print(f"Skipping {folder}: {error}")
+
+        finally:
+            if ftp is not None:
+                try:
+                    ftp.quit()
+                except:
+                    try:
+                        ftp.close()
+                    except:
+                        pass
+
+    if not all_dataframes:
+        raise RuntimeError(
+            f"No data found for symbol {symbol}"
+        )
+
+    return pd.concat(
+        all_dataframes,
+        ignore_index=True
+    )
+
+
+# =========================================================
+# SEQUENCE CREATION
+# =========================================================
+
+def create_sequences(dataframe, features, target=TARGET_COLUMN):
+    """
+    Builds sliding windows of `features` as model input (X) and, for
+    each window, the target_signal class (y) that lines up with the
+    bar right after the window ends.
+
+    Only past/current-bar information ever enters `features` -- the
+    label itself was already derived from future data inside
+    add_targets(), never the other way around.
+    """
+    feature_array = dataframe[features].to_numpy(dtype=np.float32)
+    target_array = dataframe[target].to_numpy(dtype=np.int64)
+
+    X = []
+    y = []
+
+    for index in range(SEQUENCE_LENGTH, len(dataframe)):
+        X.append(
+            feature_array[index - SEQUENCE_LENGTH:index]
+        )
+
+        # The last bar the model actually sees is at position
+        # `index - 1`, so the label for "the bar right after the
+        # window" is target_array[index - 1].
+        y.append(
+            target_array[index - 1]
+        )
+
+    return (
+        np.array(X, dtype=np.float32),
+        np.array(y, dtype=np.int64)
+    )
+
+
+# =========================================================
+# DATASET
+# =========================================================
+
+class MarketDataset(Dataset):
+
+    def __init__(self, X, y):
+        self.X = torch.tensor(
+            X,
+            dtype=torch.float32
+        )
+
+        # Class indices for CrossEntropyLoss must be long/int64, NOT
+        # float32 -- this is a classification target now, not a
+        # regression target.
+        self.y = torch.tensor(
+            y,
+            dtype=torch.long
+        )
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, index):
+        return (
+            self.X[index],
+            self.y[index]
+        )
+
+
+# =========================================================
+# TRAINING CONFIGURATION BANNER
+# =========================================================
+
+def print_training_summary(symbol, indicators, indicator_columns, features, class_counts):
+    print("=========================================")
+    print("Training Configuration")
+    print("=========================================")
+    print(f"Model  : TCN")
+    print(f"Symbol : {symbol}")
+
+    print("\nBase Features:")
+    print(BASE_FEATURES)
+
+    print("\nSelected Training Indicators:")
+    print(indicators if indicators else [])
+
+    print("\nGenerated Indicator Columns:")
+    print(indicator_columns if indicator_columns else [])
+
+    print("\nFinal Training Features:")
+    print(features)
+
+    print("\nTotal Features:")
+    print(len(features))
+
+    print("\nTarget Column:")
+    print(TARGET_COLUMN)
+
+    print("\nClasses:")
+    print(f"SELL = {SELL}")
+    print(f"HOLD = {HOLD}")
+    print(f"BUY  = {BUY}")
+
+    print("\nClass Distribution (training set):")
+    print(f"SELL: {class_counts.get(SELL, 0)}")
+    print(f"HOLD: {class_counts.get(HOLD, 0)}")
+    print(f"BUY : {class_counts.get(BUY, 0)}")
+
+    print("\nSequence Length:")
+    print(SEQUENCE_LENGTH)
+
+    print("\nBUY Threshold %:")
+    print(BUY_THRESHOLD_PCT)
+
+    print("\nSELL Threshold %:")
+    print(SELL_THRESHOLD_PCT)
+
+    print("=========================================")
+    print("Training Started...")
+    print("=========================================\n")
+
+
+# =========================================================
+# PREPARE TRAINING DATA
+# =========================================================
+
+def prepare_training_data(symbol, indicators):
+    dataframe = load_symbol_data(symbol)
+
+    print(f"\nMerged Shape: {dataframe.shape}")
+
+    dataframe.columns = [
+        column.lower().strip()
+        for column in dataframe.columns
+    ]
+
+    try:
+        dataframe["datetime"] = pd.to_datetime(
+            dataframe["datetime"],
+            unit="ms"
+        )
+    except:
+        dataframe["datetime"] = pd.to_datetime(
+            dataframe["datetime"]
+        )
+
+    dataframe = dataframe.sort_values("datetime")
+    dataframe.reset_index(drop=True, inplace=True)
+
+    # ---- Feature engineering: selected indicators only ----
+    dataframe = add_indicators(dataframe, indicators)
+    indicator_columns = resolve_indicator_columns(indicators)
+    features = resolve_feature_columns(indicators)
+
+    # ---- Target: BUY / HOLD / SELL, built from FUTURE price move ----
+    # (future data is used only to create this historical label column,
+    # never as a model input -- see add_targets()).
+    dataframe = add_targets(dataframe)
+
+    dataframe.dropna(inplace=True)
+    dataframe.reset_index(drop=True, inplace=True)
+
+    split_index = int(len(dataframe) * 0.80)
+
+    train_dataframe = dataframe.iloc[:split_index].copy()
+    test_dataframe = dataframe.iloc[split_index:].copy()
+
+    # ---- Scale input features only ----
+    # (classification labels are class indices and must NEVER be
+    # passed through a scaler)
+    train_dataframe[features] = feature_scaler.fit_transform(
+        train_dataframe[features]
+    )
+
+    test_dataframe[features] = feature_scaler.transform(
+        test_dataframe[features]
+    )
+
+    X_train, y_train = create_sequences(train_dataframe, features)
+    X_test, y_test = create_sequences(test_dataframe, features)
+
+    if len(X_train) == 0:
+        raise RuntimeError("Training dataset is empty")
+
+    if len(X_test) == 0:
+        raise RuntimeError("Validation dataset is empty")
+
+    print(f"\nTrain Shape: {X_train.shape}")
+    print(f"Test Shape : {X_test.shape}")
+
+    # ---- Class distribution + class weights (handles imbalance) ----
+    class_counts = {
+        SELL: int(np.sum(y_train == SELL)),
+        HOLD: int(np.sum(y_train == HOLD)),
+        BUY:  int(np.sum(y_train == BUY)),
+    }
+
+    class_weights_array = compute_class_weight(
+        class_weight="balanced",
+        classes=np.array([SELL, HOLD, BUY]),
+        y=y_train
+    )
+
+    class_weights = torch.tensor(
+        class_weights_array,
+        dtype=torch.float32
+    )
+
+    train_dataset = MarketDataset(
+        X_train,
+        y_train
+    )
+
+    test_dataset = MarketDataset(
+        X_test,
+        y_test
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        drop_last=True
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False
+    )
+
+    return (
+        train_loader,
+        test_loader,
+        feature_scaler,
+        features,
+        indicator_columns,
+        class_counts,
+        class_weights
+    )
+
+
+# =========================================================
+# TCN MODEL
+# The input layer size (n_features) is passed in dynamically from
+# len(features). With the full DEFAULT_INDICATORS set that's:
+#   5 base OHLCV + ema9 + ema20 + ema50 + vwap + rsi14 + atr14
+#   + macd_line + macd_signal + macd_hist = 13 total.
+#
+# The output layer now emits 3 logits: SELL / HOLD / BUY.
+# =========================================================
+
+class TemporalBlock(nn.Module):
+
+    def __init__(self, in_channels, out_channels, dilation):
+        super().__init__()
+
+        kernel_size = 5
+        padding = (kernel_size - 1) * dilation
+
+        self.conv1 = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation
+        )
+
+        self.conv2 = nn.Conv1d(
+            out_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation
+        )
+
+        self.gelu = nn.GELU()
+        self.dropout = nn.Dropout(DROPOUT_RATE)
+
+        self.downsample = (
+            nn.Conv1d(
+                in_channels,
+                out_channels,
+                kernel_size=1
+            )
+            if in_channels != out_channels
+            else None
+        )
+
+    def forward(self, x):
+        output = self.conv1(x)
+        output = output[:, :, :-self.conv1.padding[0]]
+
+        output = self.conv2(output)
+        output = output[:, :, :-self.conv2.padding[0]]
+
+        output = self.gelu(output)
+        output = self.dropout(output)
+
+        residual = x
+
+        if self.downsample:
+            residual = self.downsample(x)
+
+        min_length = min(
+            output.shape[2],
+            residual.shape[2]
+        )
+
+        output = output[:, :, -min_length:]
+        residual = residual[:, :, -min_length:]
+
+        return output + residual
+
+
+class TCNClassifier(nn.Module):
+
+    # Exactly 3 output classes: SELL (0), HOLD (1), BUY (2).
+    N_CLASSES = 3
+
+    def __init__(self, n_features):
+        super().__init__()
+
+        self.block1 = TemporalBlock(
+            n_features,
+            32,
+            dilation=1
+        )
+
+        self.block2 = TemporalBlock(
+            32,
+            64,
+            dilation=2
+        )
+
+        self.block3 = TemporalBlock(
+            64,
+            64,
+            dilation=4
+        )
+
+        self.block4 = TemporalBlock(
+            64,
+            64,
+            dilation=8
+        )
+
+        self.gelu = nn.GELU()
+        self.dropout = nn.Dropout(DROPOUT_RATE)
+        self.recent_timesteps = 4
+
+        self.fc1 = nn.Linear(
+            64 * self.recent_timesteps,
+            128
+        )
+
+        self.fc2 = nn.Linear(
+            128,
+            64
+        )
+
+        # 3 raw logits: index 0 = SELL, index 1 = HOLD, index 2 = BUY.
+        # These are NOT probabilities yet -- softmax is applied
+        # separately during validation / inference.
+        self.classifier = nn.Linear(
+            64,
+            self.N_CLASSES
+        )
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+
+        x = x[:, :, -self.recent_timesteps:]
+
+        x = x.reshape(
+            x.size(0),
+            -1
+        )
+
+        x = self.fc1(x)
+        x = self.gelu(x)
+        x = self.dropout(x)
+
+        x = self.fc2(x)
+        x = self.gelu(x)
+        x = self.dropout(x)
+
+        x = self.classifier(x)
+
+        # shape: (batch, 3) -- raw SELL/HOLD/BUY logits.
+        return x
+
+
+# =========================================================
+# SIGNAL / CONFIDENCE HELPERS
+# =========================================================
+
+def decode_prediction(logits):
+    """
+    Converts a single row of raw model logits (shape: (3,)) into the
+    dashboard-friendly prediction format:
+
+        {
+            "signal": "BUY",
+            "confidence": 85.42,
+            "probabilities": {
+                "SELL": 5.12,
+                "HOLD": 9.46,
+                "BUY": 85.42
+            }
+        }
+
+    This is the same decoding a separate inference script should use
+    at prediction time.
+    """
+    logits_tensor = torch.as_tensor(logits, dtype=torch.float32)
+
+    probabilities = torch.softmax(logits_tensor, dim=0)
+    predicted_class = int(torch.argmax(probabilities).item())
+
+    probabilities_pct = {
+        SIGNAL_CLASSES[class_index]: round(float(probabilities[class_index]) * 100, 2)
+        for class_index in SIGNAL_CLASSES
+    }
+
+    return {
+        "signal": SIGNAL_CLASSES[predicted_class],
+        "confidence": probabilities_pct[SIGNAL_CLASSES[predicted_class]],
+        "probabilities": probabilities_pct,
+    }
+
+
+# =========================================================
+# METRICS (classification)
+# =========================================================
+
+train_losses = []
+val_losses = []
+accuracy_list = []
+precision_list = []
+recall_list = []
+f1_list = []
+
+
+# =========================================================
+# TRAINING FUNCTION
+# =========================================================
+
+def train_model(
+    symbol=DEFAULT_SYMBOL,
+    indicators=None,
+    progress_callback=None,
+    stop_callback=None
+):
+    # Default to the full EMA9 + EMA20 + EMA50 + VWAP + RSI14 + ATR14
+    # + MACD indicator set for this pipeline. Callers can still pass a
+    # subset, but nothing outside INDICATOR_COLUMN_MAP is accepted --
+    # see INDICATOR_REGISTRY / normalize_indicator_name().
+    if indicators is None:
+        indicators = list(DEFAULT_INDICATORS)
+
+    # ---- Normalize into canonical names ----
+    indicators = normalize_indicator_list(indicators)
+
+    best_val_loss = np.inf
+    patience_counter = 0
+
+    train_losses.clear()
+    val_losses.clear()
+    accuracy_list.clear()
+    precision_list.clear()
+    recall_list.clear()
+    f1_list.clear()
+
+    symbol = symbol.upper()
+
+    MODEL_PATH = (
+        Path(__file__).parent.parent
+        / "models"
+        / f"best_tcn_{symbol.lower()}.pth"
+    )
+
+    MODEL_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    (
+        train_loader,
+        test_loader,
+        feature_scaler,
+        features,
+        indicator_columns,
+        class_counts,
+        class_weights
+    ) = prepare_training_data(symbol, indicators)
+
+    # ---- Print the full pre-training configuration banner ----
+    print_training_summary(symbol, indicators, indicator_columns, features, class_counts)
+
+    # 3-class classification loss. Class weights counteract HOLD
+    # dominating the dataset so the model doesn't just learn to
+    # always predict HOLD.
+    criterion = nn.CrossEntropyLoss(weight=class_weights.to(DEVICE))
+
+    model = TCNClassifier(
+        n_features=len(features)
+    ).to(DEVICE)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY
+    )
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=10
+    )
+
+    for epoch in range(EPOCHS):
+        print(f"\nEpoch [{epoch + 1}/{EPOCHS}] Started...")
+
+        model.train()
+
+        running_train_loss = 0
+
+        for X_batch, y_batch in train_loader:
+            if stop_callback and stop_callback():
+                print("\nTraining Stopped By User")
+                return False
+
+            X_batch = X_batch.to(DEVICE)
+            y_batch = y_batch.to(DEVICE)
+
+            optimizer.zero_grad()
+
+            logits = model(X_batch)
+
+            loss = criterion(logits, y_batch)
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                1.0
+            )
+
+            optimizer.step()
+
+            running_train_loss += loss.item()
+
+        avg_train_loss = running_train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+
+        model.eval()
+
+        running_val_loss = 0
+        all_predicted_classes = []
+        all_true_classes = []
+
+        with torch.no_grad():
+            for X_batch, y_batch in test_loader:
+                X_batch = X_batch.to(DEVICE)
+                y_batch = y_batch.to(DEVICE)
+
+                logits = model(X_batch)
+
+                loss = criterion(logits, y_batch)
+
+                running_val_loss += loss.item()
+
+                probabilities = torch.softmax(logits, dim=1)
+                predicted_class = torch.argmax(probabilities, dim=1)
+
+                all_predicted_classes.extend(
+                    predicted_class.cpu().numpy()
+                )
+
+                all_true_classes.extend(
+                    y_batch.cpu().numpy()
+                )
+
+        avg_val_loss = running_val_loss / len(test_loader)
+        val_losses.append(avg_val_loss)
+
+        scheduler.step(avg_val_loss)
+
+        all_predicted_classes = np.array(all_predicted_classes)
+        all_true_classes = np.array(all_true_classes)
+
+        accuracy = accuracy_score(all_true_classes, all_predicted_classes)
+
+        precision = precision_score(
+            all_true_classes,
+            all_predicted_classes,
+            average="weighted",
+            zero_division=0
+        )
+
+        recall = recall_score(
+            all_true_classes,
+            all_predicted_classes,
+            average="weighted",
+            zero_division=0
+        )
+
+        f1 = f1_score(
+            all_true_classes,
+            all_predicted_classes,
+            average="weighted",
+            zero_division=0
+        )
+
+        conf_matrix = confusion_matrix(
+            all_true_classes,
+            all_predicted_classes,
+            labels=[SELL, HOLD, BUY]
+        )
+
+        accuracy_list.append(accuracy)
+        precision_list.append(precision)
+        recall_list.append(recall)
+        f1_list.append(f1)
+
+        print(f"Epoch [{epoch + 1}] Completed")
+        print(f"Train Loss          : {avg_train_loss:.6f}")
+        print(f"Validation Loss     : {avg_val_loss:.6f}")
+        print(f"Accuracy            : {accuracy:.4f}")
+        print(f"Precision           : {precision:.4f}")
+        print(f"Recall              : {recall:.4f}")
+        print(f"F1 Score            : {f1:.4f}")
+        print("Confusion Matrix (rows=true, cols=pred) [SELL, HOLD, BUY]:")
+        print(conf_matrix)
+
+        if progress_callback:
+            progress_callback(
+                epoch + 1,
+                EPOCHS,
+                avg_train_loss,
+                avg_val_loss
+            )
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "features": features,
+                    "indicators": indicators,
+                    "indicator_columns": indicator_columns,
+                    "sequence_length": SEQUENCE_LENGTH,
+
+                    "signal_classes": SIGNAL_CLASSES,
+
+                    "buy_threshold_pct": BUY_THRESHOLD_PCT,
+                    "sell_threshold_pct": SELL_THRESHOLD_PCT,
+
+                    "feature_scaler_mean": feature_scaler.mean_,
+                    "feature_scaler_scale": feature_scaler.scale_,
+
+                    "validation_accuracy": accuracy,
+                    "validation_f1": f1,
+
+                    "dropout_rate": DROPOUT_RATE,
+                },
+                MODEL_PATH
+            )
+
+            print("\nBest TCN Classification Model Saved")
+
+        else:
+            patience_counter += 1
+
+        if patience_counter >= PATIENCE:
+            print("\nEarly Stopping Triggered")
+            return True
+
+    print("\nTCN Training Complete.")
+    return True
+
+
+if __name__ == "__main__":
+    # Standalone run: trains on OHLCV + EMA9 + EMA20 + EMA50 + VWAP +
+    # RSI14 + ATR14 + MACD (the pipeline's full feature set) and
+    # predicts BUY / HOLD / SELL directly -- no separate rule-based
+    # signal engine is used.
+    train_model(symbol=DEFAULT_SYMBOL, indicators=DEFAULT_INDICATORS)
