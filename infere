@@ -1,0 +1,186 @@
+"""
+decision_agent.py
+
+Compatibility / pass-through layer for code that still imports
+`decision_agent`. It does NOT make a trading decision.
+
+Current architecture
+---------------------
+    TCN_Training.py
+        -> trained TCN classifier
+        -> tcn_predictor.py         (predictor.predict(df))
+        -> BUY / SELL / HOLD + confidence + probabilities
+        -> decision_agent.py        (THIS FILE -- validate/pass through only)
+        -> signal_logic.py
+        -> inference_engine.py
+        -> app.py
+        -> frontend
+
+The TCN is a 3-class classifier trained on OHLCV plus EMA9/EMA20/EMA50,
+VWAP, RSI14, ATR14, and MACD. `TCNPredictor.predict(df)` already
+returns the finished classification result as a dict:
+
+    {
+        "signal": "BUY",
+        "confidence": 0.87,
+        "probabilities": {"SELL": 0.05, "HOLD": 0.08, "BUY": 0.87},
+        "symbol": "SPY",
+        "sequence_length": 60,
+        "indicators": [...],
+        "features": [...],
+    }
+
+This module's ONLY job is to validate that dict and hand it back
+unchanged. It does not compute EMA9/EMA20, does not compare them,
+does not build a prediction line, does not call or train the TCN, and
+does not produce a second, independent BUY/SELL/HOLD opinion. The TCN
+is the single source of truth for the trading signal.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+
+VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
+
+
+class InvalidPredictionError(ValueError):
+    """
+    Raised when the TCN prediction result passed into DecisionAgent is
+    missing, malformed, or contains a signal outside BUY/SELL/HOLD.
+    """
+
+
+# Metadata fields we know about and will pass through untouched if the
+# predictor included them. Informational only -- any other field on the
+# prediction result is preserved too (see run() below), so nothing the
+# TCN pipeline produces is silently dropped.
+KNOWN_METADATA_FIELDS = (
+    "symbol",
+    "sequence_length",
+    "indicators",
+    "features",
+)
+
+
+class DecisionAgent:
+    """
+    Validates and passes through the TCN's classification result.
+
+    Usage:
+        from engine.decision_agent import DecisionAgent
+
+        agent = DecisionAgent()
+        prediction_result = predictor.predict(df)   # from tcn_predictor.py
+        result = agent.run(prediction_result)
+        # result["signal"] is exactly what the TCN decided -- unchanged
+    """
+
+    def run(self, prediction_result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Validate the TCN's prediction result and return it, normalized
+        but otherwise unchanged. Never calculates or overrides a signal.
+
+        Raises:
+            InvalidPredictionError: if the result is missing, not a dict,
+                missing a 'signal' field, or the signal isn't one of
+                BUY / SELL / HOLD.
+        """
+        if prediction_result is None:
+            raise InvalidPredictionError(
+                "No prediction result was provided (got None). Make sure "
+                "TCNPredictor.predict(df) ran successfully before calling "
+                "DecisionAgent.run()."
+            )
+
+        if not isinstance(prediction_result, dict):
+            raise InvalidPredictionError(
+                "prediction_result must be a dict returned by "
+                f"TCNPredictor.predict(df), got {type(prediction_result).__name__} instead."
+            )
+
+        raw_signal = prediction_result.get("signal")
+        if raw_signal is None or (isinstance(raw_signal, str) and not raw_signal.strip()):
+            raise InvalidPredictionError(
+                "prediction_result is missing a 'signal' field. Expected the "
+                "TCN predictor to return one of: BUY, SELL, HOLD."
+            )
+
+        signal_str = str(raw_signal).strip().upper()
+        if signal_str not in VALID_SIGNALS:
+            raise InvalidPredictionError(
+                f"Invalid signal '{raw_signal}' from TCN prediction. "
+                f"Expected one of {sorted(VALID_SIGNALS)}."
+            )
+
+        # Start from a shallow copy so we never mutate the caller's dict,
+        # then normalize just the signal casing. Everything else --
+        # confidence, probabilities, symbol, sequence_length, indicators,
+        # features, and any other field the predictor included -- is
+        # preserved exactly as the TCN produced it.
+        result = dict(prediction_result)
+        result["signal"] = signal_str
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible function wrapper
+# ---------------------------------------------------------------------------
+#
+# The OLD run_decision_agent(symbol, dataframe, model="TCN", steps=LINE_STEPS)
+# cannot be preserved as-is. That old signature built its own predictor,
+# called predictor.predict(dataframe, steps) to get a multi-step price
+# forecast, computed EMA9/EMA20 itself, and combined the two into an
+# independent BUY/SELL/HOLD decision. Every one of those responsibilities
+# is now explicitly off-limits for this file: decision_agent.py must not
+# call/train the TCN, must not compute EMA9/EMA20, and must not produce a
+# second trading signal. There is no safe way to keep the old (symbol,
+# dataframe, model, steps) signature working without reintroducing that
+# old architecture.
+#
+# Instead, this wrapper keeps the *name* `run_decision_agent` importable
+# for existing code, but its job is now the same as DecisionAgent.run():
+# validate and pass through an already-computed TCN prediction result.
+# Callers that used to do:
+#
+#     result = run_decision_agent("SPY", df, model="TCN")
+#
+# now need to compute the prediction first and pass the result in:
+#
+#     prediction_result = predictor.predict(df)   # from tcn_predictor.py
+#     result = run_decision_agent(prediction_result)
+#
+def run_decision_agent(prediction_result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Backward-compatible function wrapper around DecisionAgent.run().
+
+    IMPORTANT: the signature has changed from the old
+    (symbol, dataframe, model, steps) to a single argument -- the dict
+    already returned by TCNPredictor.predict(df). See the note above for
+    why the old signature could not be kept.
+    """
+    return DecisionAgent().run(prediction_result)
+
+
+if __name__ == "__main__":
+    # Minimal smoke test using a fake TCN prediction result. This block
+    # only sanity-checks validation/passthrough in isolation -- it is
+    # never used by the real pipeline.
+    fake_prediction = {
+        "signal": "BUY",
+        "confidence": 0.87,
+        "probabilities": {"SELL": 0.05, "HOLD": 0.08, "BUY": 0.87},
+        "symbol": "SPY",
+        "sequence_length": 60,
+        "indicators": ["EMA9", "EMA20", "EMA50", "VWAP", "RSI14", "ATR14", "MACD"],
+        "features": ["open", "high", "low", "close", "volume"],
+    }
+
+    agent = DecisionAgent()
+    print(agent.run(fake_prediction))
+
+    try:
+        agent.run({"confidence": 0.5})
+    except InvalidPredictionError as e:
+        print(f"Correctly rejected bad input: {e}")
