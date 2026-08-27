@@ -1,0 +1,279 @@
+"""
+decision_agent.py
+
+Turns a predictor's forecast + the full indicator stack (EMA9/EMA20/EMA50,
+VWAP, RSI14, MACD) into a BUY / SELL / HOLD decision.
+
+    TCN prediction
+        +
+    EMA9 / EMA20 / EMA50 / VWAP / RSI14 / MACD
+        |
+        v
+    SignalEngine (engine.signal_logic)
+        |
+        v
+    BUY / SELL / HOLD
+
+IMPORTANT -- single source of truth:
+    This module does NOT decide BUY/SELL/HOLD itself and does NOT
+    duplicate any of signal_logic.py's conditions. Its only job is to:
+
+        1. Get the model's prediction (predicted_next_open).
+        2. Compute/prepare the required indicator values
+           (ema9, ema20, ema50, vwap, rsi14, macd_line, macd_signal,
+           macd_hist) plus current_price.
+        3. Hand all of that to `engine.signal_logic.SignalEngine().generate(...)`.
+        4. Return the resulting signal, plus the prediction/indicator
+           context that app.py needs for display/charting.
+
+    All BUY/SELL/HOLD logic (TCN-move-vs-threshold, EMA9>EMA20>EMA50,
+    VWAP side, MACD, RSI band, ATR exclusion, etc.) lives ONLY in
+    signal_logic.py. If those rules ever need to change, change them
+    there -- not here.
+
+Model-agnostic: works with either engine.tcn_predictor.TCNPredictor or
+engine.gru_predictor.GRUPredictor, AS LONG AS both expose the same
+.predict(df, future_steps) -> (future_times, prediction_line)
+interface. The current TCN pipeline is single-target (next_open only,
+no classification head), so predict() returns a 2-tuple. If GRU still
+returns a 3-tuple (with a direction-probability list), this dispatch
+will break for "GRU" until GRU is trimmed to match the same
+single-target interface.
+
+`prediction_line[0]` (the first forecasted step) is used as
+`predicted_next_open`, which is the single value signal_logic.py's
+BUY/SELL/HOLD gate actually consumes. The full `prediction_line` is
+still returned on the Decision for any multi-step charting app.py does.
+
+EMA9/EMA20/EMA50/VWAP/RSI14/MACD are all computed directly here from
+the raw OHLCV dataframe (same formulas used elsewhere in this
+codebase: df["close"].ewm(span=N, adjust=False).mean() for EMAs, a
+session-cumulative typical-price VWAP, Wilder-smoothed RSI14, and the
+standard 12/26/9 MACD), rather than through either predictor's
+internal indicator machinery. This keeps the module decoupled from
+TCN-vs-GRU-specific internals and means it works even for a checkpoint
+trained without these indicators in its feature list.
+
+ATR14 is intentionally NOT computed or used here -- signal_logic.py's
+decision does not consult it, and no ATR-based SL/TP is computed here.
+
+NOTE: this replaces the previous EMA9-vs-EMA20 + prediction-line
+rising/falling rule that used to live in this file as an independent
+signal-generation system. That rule has been removed; signal_logic.py
+is now the only place BUY/SELL/HOLD is decided.
+"""
+
+from dataclasses import dataclass
+from typing import Optional
+
+import pandas as pd
+
+from engine.tcn_predictor import TCNPredictor
+from engine.gru_predictor import GRUPredictor
+from engine.signal_logic import SignalEngine, SignalLogicConfig
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+# How many bars ahead to forecast. prediction_line[0] (the nearest
+# future step) is what's actually passed to SignalEngine as
+# predicted_next_open; the rest of the line is kept for charting only.
+LINE_STEPS = 5
+
+
+# =========================================================
+# RESULT CONTAINER
+# =========================================================
+
+@dataclass
+class Decision:
+    action: str                          # "BUY" | "SELL" | "HOLD" (from SignalEngine/signal_logic.py)
+    trend: str                           # "UP" | "DOWN" | "FLAT" -- informational, from signal_logic.py
+
+    # Indicators fed into SignalEngine
+    ema9: float
+    ema20: float
+    ema50: float
+    vwap: float
+    rsi14: float
+    macd_line: float
+    macd_signal: float
+    macd_hist: float
+
+    # Prediction context
+    predicted_next_open: float           # value actually passed to SignalEngine
+    predicted_move_pct: float            # from signal_logic.py's output
+    prediction_line: list                # [open+1, ..., open+LINE_STEPS], real price units, for charting
+
+    last_close: float                    # == current_price passed to SignalEngine
+
+
+# =========================================================
+# MODEL SELECTION (mirrors app.py's TCN/GRU dispatch in /forecast)
+# =========================================================
+
+def get_predictor(model_name, symbol):
+    model_name = model_name.upper()
+
+    if model_name == "TCN":
+        return TCNPredictor(symbol)
+    elif model_name == "GRU":
+        return GRUPredictor(symbol)
+
+    raise ValueError(f"Unknown model: {model_name}")
+
+
+# =========================================================
+# INDICATOR COMPUTATION
+#
+# All computed directly from raw OHLCV here (not via the predictors),
+# so this module stays decoupled from TCN/GRU internals. These are
+# CONFIRMATION inputs only -- none of the BUY/SELL/HOLD decision logic
+# lives in this file; it's all handed off to SignalEngine below.
+# =========================================================
+
+def compute_latest_indicators(dataframe: pd.DataFrame) -> dict:
+    """
+    Computes EMA9, EMA20, EMA50, VWAP, RSI14, and MACD (line/signal/hist)
+    from a raw OHLCV dataframe (oldest -> newest), and returns the most
+    recent value of each, plus the most recent close (current_price).
+
+    Same conventions used elsewhere in this codebase:
+        EMA:  close.ewm(span=N, adjust=False).mean()
+        MACD: ema12 - ema26 (line), ewm(span=9) of the line (signal),
+              line - signal (hist)
+        RSI14: Wilder-style smoothing (ewm with alpha=1/14)
+        VWAP: cumulative typical-price VWAP over the given dataframe
+              ((high+low+close)/3, volume-weighted, cumulative)
+
+    ATR14 is deliberately not computed here -- it isn't part of the
+    signal_logic.py decision.
+    """
+    df = dataframe.copy()
+    df.columns = [c.lower().strip() for c in df.columns]
+
+    close = df["close"]
+
+    ema9_series = close.ewm(span=9, adjust=False).mean()
+    ema20_series = close.ewm(span=20, adjust=False).mean()
+    ema50_series = close.ewm(span=50, adjust=False).mean()
+
+    ema12_series = close.ewm(span=12, adjust=False).mean()
+    ema26_series = close.ewm(span=26, adjust=False).mean()
+    macd_line_series = ema12_series - ema26_series
+    macd_signal_series = macd_line_series.ewm(span=9, adjust=False).mean()
+    macd_hist_series = macd_line_series - macd_signal_series
+
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    rsi14_series = 100 - (100 / (1 + rs))
+    # Where avg_loss is 0 (no down moves at all), RS is inf -> RSI should be 100.
+    rsi14_series = rsi14_series.where(avg_loss != 0, 100.0)
+
+    typical_price = (df["high"] + df["low"] + close) / 3
+    vwap_series = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
+
+    return {
+        "ema9": float(ema9_series.iloc[-1]),
+        "ema20": float(ema20_series.iloc[-1]),
+        "ema50": float(ema50_series.iloc[-1]),
+        "vwap": float(vwap_series.iloc[-1]),
+        "rsi14": float(rsi14_series.iloc[-1]),
+        "macd_line": float(macd_line_series.iloc[-1]),
+        "macd_signal": float(macd_signal_series.iloc[-1]),
+        "macd_hist": float(macd_hist_series.iloc[-1]),
+        "current_price": float(close.iloc[-1]),
+    }
+
+
+# =========================================================
+# TOP-LEVEL ENTRY POINT
+# =========================================================
+
+def run_decision_agent(
+    symbol,
+    dataframe,
+    model="TCN",
+    steps=LINE_STEPS,
+    signal_config: Optional[SignalLogicConfig] = None,
+):
+    """
+    dataframe: raw OHLCV, oldest -> newest, columns
+    open/high/low/close/volume (+ datetime, case-insensitive) --
+    e.g. straight from engine.load_data(symbol) in app.py.
+
+    Pipeline:
+        1. Get the predictor's forecast -> predicted_next_open.
+        2. Compute EMA9/EMA20/EMA50/VWAP/RSI14/MACD from the dataframe.
+        3. Hand current_price + predicted_next_open + all indicators to
+           SignalEngine().generate(...) (engine.signal_logic).
+        4. Return the resulting action/trend plus prediction context.
+    """
+    predictor = get_predictor(model, symbol)
+
+    # Single-target predictor interface: (future_times, prediction_line).
+    _future_times, prediction_line = predictor.predict(dataframe, steps)
+    predicted_next_open = float(prediction_line[0])
+
+    indicators = compute_latest_indicators(dataframe)
+
+    # Build the single-row input SignalEngine/signal_logic.py expects.
+    signal_input = pd.DataFrame(
+        [
+            {
+                "current_price": indicators["current_price"],
+                "predicted_next_open": predicted_next_open,
+                "ema9": indicators["ema9"],
+                "ema20": indicators["ema20"],
+                "ema50": indicators["ema50"],
+                "vwap": indicators["vwap"],
+                "rsi14": indicators["rsi14"],
+                "macd_line": indicators["macd_line"],
+                "macd_signal": indicators["macd_signal"],
+                "macd_hist": indicators["macd_hist"],
+            }
+        ]
+    )
+
+    engine = SignalEngine(config=signal_config or SignalLogicConfig())
+    result = engine.generate(signal_input)
+    latest = result.iloc[-1]
+
+    return Decision(
+        action=str(latest["signal"]),
+        trend=str(latest["trend"]),
+        ema9=indicators["ema9"],
+        ema20=indicators["ema20"],
+        ema50=indicators["ema50"],
+        vwap=indicators["vwap"],
+        rsi14=indicators["rsi14"],
+        macd_line=indicators["macd_line"],
+        macd_signal=indicators["macd_signal"],
+        macd_hist=indicators["macd_hist"],
+        predicted_next_open=predicted_next_open,
+        predicted_move_pct=float(latest["predicted_move_pct"]),
+        prediction_line=list(prediction_line),
+        last_close=indicators["current_price"],
+    )
+
+
+if __name__ == "__main__":
+    # Example manual test.
+    #
+    # from engine.inference_engine import InferenceEngine
+    # engine = InferenceEngine()
+    # df = engine.load_data("SPY")
+    # result = run_decision_agent("SPY", df, model="TCN")
+    # print(f"Action: {result.action}  (trend={result.trend})")
+    # print(f"EMA9={result.ema9:.4f}  EMA20={result.ema20:.4f}  EMA50={result.ema50:.4f}")
+    # print(f"VWAP={result.vwap:.4f}  RSI14={result.rsi14:.2f}")
+    # print(f"MACD line={result.macd_line:.4f}  signal={result.macd_signal:.4f}  hist={result.macd_hist:.4f}")
+    # print(f"Predicted next open={result.predicted_next_open:.4f}  move%={result.predicted_move_pct:.4%}")
+    # print(f"Prediction line: {result.prediction_line}")
+    pass
