@@ -1,0 +1,702 @@
+"""
+engine/tcn_predictor.py
+
+Inference-side counterpart to TCN_Training.py's dual-head TCN
+(return regression + SELL/HOLD/BUY classification). Every architecture
+class below (Chomp1d, TemporalBlock, TemporalConvNet, TCNDualHead) is a
+line-for-line match of the training module -- including submodule
+names -- so that `model.load_state_dict(checkpoint["model_state_dict"])`
+succeeds with no size or key mismatch.
+
+Nothing here fits new scalers or invents feature columns: everything
+that was saved into the checkpoint (features, indicators, sequence
+length, scalers, direction classes/threshold, close/open feature
+indices, etc.) is read back from it, with fallbacks only for older
+checkpoints that may predate a given field.
+"""
+
+import torch
+import torch.nn as nn
+from torch.nn.utils import weight_norm
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.preprocessing import StandardScaler
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# =========================================================
+# FALLBACK DEFAULTS
+#
+# These are only used when an older checkpoint doesn't contain the
+# corresponding key. Whenever the checkpoint HAS the value, that value
+# always wins -- see TCNPredictor.__init__.
+# =========================================================
+
+DEFAULT_SEQUENCE_LENGTH = 60
+DEFAULT_TCN_NUM_CHANNELS = [64, 64, 128, 128]
+DEFAULT_TCN_KERNEL_SIZE = 3
+DEFAULT_DROPOUT_RATE = 0.2
+
+DEFAULT_TARGET_COLUMNS = ["target_next_return"]
+DEFAULT_TARGET_TYPE = "return"
+
+DEFAULT_DIRECTION_CLASSES = ["SELL", "HOLD", "BUY"]
+DEFAULT_DIRECTION_THRESHOLD = 0.0015
+
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+
+# Must match TCN_Training.py's BASE_FEATURES exactly (same order) --
+# the scaler and saved "features" list depend on this ordering.
+BASE_FEATURES = ["high", "low", "close", "volume", "open"]
+
+DEFAULT_CLOSE_FEATURE_INDEX = BASE_FEATURES.index("close")  # 2
+DEFAULT_OPEN_FEATURE_INDEX = BASE_FEATURES.index("open")    # 4
+
+INDICATOR_COLUMN_MAP = {
+    "EMA9":  ["ema9"],
+    "EMA20": ["ema20"],
+    "EMA50": ["ema50"],
+    "VWAP":  ["vwap"],
+    "RSI14": ["rsi14"],
+    "ATR14": ["atr14"],
+    "MACD":  ["macd_line", "macd_signal", "macd_hist"],
+}
+
+
+# =========================================================
+# INDICATOR NAME NORMALIZATION -- matches TCN_Training.py
+# =========================================================
+
+def normalize_indicator_name(name):
+    cleaned = str(name).strip().upper()
+    cleaned = cleaned.replace("_", " ").replace("-", " ")
+    cleaned = " ".join(cleaned.split())
+    no_space = cleaned.replace(" ", "")
+
+    for canonical in INDICATOR_COLUMN_MAP.keys():
+        if canonical.upper().replace(" ", "") == no_space:
+            return canonical
+
+    raise ValueError(
+        f"Unknown indicator '{name}'. This pipeline only supports: "
+        f"{list(INDICATOR_COLUMN_MAP.keys())}"
+    )
+
+
+def normalize_indicator_list(indicators):
+    normalized = []
+    for raw_name in indicators:
+        canonical = normalize_indicator_name(raw_name)
+        if canonical not in normalized:
+            normalized.append(canonical)
+    return normalized
+
+
+# Old predictor's public name for the same thing -- kept as an alias so
+# any existing import of `normalize_indicators` keeps working.
+normalize_indicators = normalize_indicator_list
+
+
+# =========================================================
+# INDICATOR FORMULAS -- copied verbatim from TCN_Training.py
+# =========================================================
+
+def compute_rsi(close, period=RSI_PERIOD):
+    delta = close.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    return 100 - (100 / (1 + rs))
+
+
+def compute_atr(dataframe, period=ATR_PERIOD):
+    high_low = dataframe["high"] - dataframe["low"]
+    high_close = (dataframe["high"] - dataframe["close"].shift()).abs()
+    low_close = (dataframe["low"] - dataframe["close"].shift()).abs()
+
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+
+    return true_range.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def compute_vwap(dataframe):
+    typical_price = (dataframe["high"] + dataframe["low"] + dataframe["close"]) / 3
+    cumulative_pv = (typical_price * dataframe["volume"]).cumsum()
+    cumulative_volume = dataframe["volume"].cumsum().replace(0, np.nan)
+
+    return cumulative_pv / cumulative_volume
+
+
+def compute_macd(dataframe, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
+    ema_fast = dataframe["close"].ewm(span=fast, adjust=False).mean()
+    ema_slow = dataframe["close"].ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+
+    return pd.DataFrame({
+        "macd_line":   macd_line,
+        "macd_signal": signal_line,
+        "macd_hist":   macd_line - signal_line,
+    })
+
+
+INDICATOR_REGISTRY = {
+    "EMA9":  lambda df: df["close"].ewm(span=9, adjust=False).mean(),
+    "EMA20": lambda df: df["close"].ewm(span=20, adjust=False).mean(),
+    "EMA50": lambda df: df["close"].ewm(span=50, adjust=False).mean(),
+    "VWAP":  lambda df: compute_vwap(df),
+    "RSI14": lambda df: compute_rsi(df["close"], period=RSI_PERIOD),
+    "ATR14": lambda df: compute_atr(df, period=ATR_PERIOD),
+    "MACD":  lambda df: compute_macd(df, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL),
+}
+
+
+def add_indicators(dataframe, indicators):
+    """Unconditional recompute -- identical to TCN_Training.py's
+    add_indicators. Used internally by add_missing_features below."""
+    dataframe = dataframe.copy()
+
+    for name in indicators:
+        if name not in INDICATOR_REGISTRY:
+            raise ValueError(f"Unknown indicator: {name}")
+
+        result = INDICATOR_REGISTRY[name](dataframe)
+
+        if isinstance(result, pd.DataFrame):
+            for col in result.columns:
+                dataframe[col] = result[col]
+        else:
+            dataframe[INDICATOR_COLUMN_MAP[name][0]] = result
+
+    return dataframe
+
+
+def add_missing_features(dataframe, indicators):
+    """Inference-side convenience wrapper: only computes indicator
+    columns that aren't already present in the incoming dataframe
+    (e.g. if the caller's live feed already attaches them), using the
+    exact same formulas as add_indicators/TCN_Training.py. Any column
+    that IS already present is left untouched rather than recomputed."""
+    missing = [
+        name for name in indicators
+        if not all(c in dataframe.columns for c in INDICATOR_COLUMN_MAP[name])
+    ]
+
+    if not missing:
+        return dataframe.copy()
+
+    dataframe = dataframe.copy()
+    computed = add_indicators(dataframe, missing)
+
+    for name in missing:
+        for col in INDICATOR_COLUMN_MAP[name]:
+            dataframe[col] = computed[col]
+
+    return dataframe
+
+
+def resolve_indicator_columns(indicators):
+    columns = []
+    for name in indicators:
+        columns.extend(INDICATOR_COLUMN_MAP[name])
+    return columns
+
+
+def resolve_feature_columns(indicators):
+    return list(BASE_FEATURES) + resolve_indicator_columns(indicators)
+
+
+# =========================================================
+# TCN MODEL -- line-for-line match of TCN_Training.py
+# (attribute names matter: they define the state_dict keys)
+# =========================================================
+
+class Chomp1d(nn.Module):
+    """Trims the extra right-side padding a causal dilated conv leaves
+    behind, so output length matches input length and no future
+    timestep ever leaks into the receptive field of an earlier one."""
+
+    def __init__(self, chomp_size):
+        super().__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x):
+        if self.chomp_size == 0:
+            return x
+        return x[:, :, :-self.chomp_size].contiguous()
+
+
+class TemporalBlock(nn.Module):
+    """One residual block of two causal dilated convolutions."""
+
+    def __init__(self, n_inputs, n_outputs, kernel_size, dilation, dropout):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+
+        self.conv1 = weight_norm(nn.Conv1d(
+            n_inputs, n_outputs, kernel_size,
+            padding=padding, dilation=dilation
+        ))
+        self.chomp1 = Chomp1d(padding)
+        self.act1 = nn.GELU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = weight_norm(nn.Conv1d(
+            n_outputs, n_outputs, kernel_size,
+            padding=padding, dilation=dilation
+        ))
+        self.chomp2 = Chomp1d(padding)
+        self.act2 = nn.GELU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.out_act = nn.GELU()
+
+        self._init_weights()
+
+    def _init_weights(self):
+        self.conv1.weight.data.normal_(0, 0.01)
+        self.conv2.weight.data.normal_(0, 0.01)
+        if self.downsample is not None:
+            self.downsample.weight.data.normal_(0, 0.01)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.chomp1(out)
+        out = self.act1(out)
+        out = self.dropout1(out)
+
+        out = self.conv2(out)
+        out = self.chomp2(out)
+        out = self.act2(out)
+        out = self.dropout2(out)
+
+        residual = x if self.downsample is None else self.downsample(x)
+        return self.out_act(out + residual)
+
+
+class TemporalConvNet(nn.Module):
+
+    def __init__(self, num_inputs, num_channels, kernel_size=DEFAULT_TCN_KERNEL_SIZE,
+                 dropout=DEFAULT_DROPOUT_RATE):
+        super().__init__()
+
+        blocks = []
+        num_levels = len(num_channels)
+
+        for level in range(num_levels):
+            dilation = 2 ** level
+            in_channels = num_inputs if level == 0 else num_channels[level - 1]
+            out_channels = num_channels[level]
+
+            blocks.append(TemporalBlock(
+                in_channels, out_channels,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                dropout=dropout,
+            ))
+
+        self.network = nn.Sequential(*blocks)
+
+    def forward(self, x):
+        # x: (batch, channels, seq_len)
+        return self.network(x)
+
+
+class TCNDualHead(nn.Module):
+    """60 candles -> TCN trunk -> shared FC -> {return head, direction
+    head}. Must match TCN_Training.py's TCNDualHead exactly."""
+
+    def __init__(
+        self,
+        n_features,
+        num_channels=DEFAULT_TCN_NUM_CHANNELS,
+        kernel_size=DEFAULT_TCN_KERNEL_SIZE,
+        dropout=DEFAULT_DROPOUT_RATE,
+        n_direction_classes=len(DEFAULT_DIRECTION_CLASSES),
+    ):
+        super().__init__()
+
+        self.tcn = TemporalConvNet(
+            num_inputs=n_features,
+            num_channels=num_channels,
+            kernel_size=kernel_size,
+            dropout=dropout,
+        )
+
+        trunk_dim = num_channels[-1]
+
+        self.dropout = nn.Dropout(dropout)
+        self.shared_fc = nn.Linear(trunk_dim, 64)
+        self.gelu = nn.GELU()
+
+        self.return_head = nn.Linear(64, 1)
+        self.direction_head = nn.Linear(64, n_direction_classes)
+
+    def forward(self, x):
+        # incoming x: (batch, seq_len, n_features) -- TCN wants channels-first
+        x = x.transpose(1, 2)
+
+        trunk_out = self.tcn(x)
+
+        # Last timestep summarizes the full 60-candle causal window.
+        trunk_out = trunk_out[:, :, -1]
+
+        trunk_out = self.dropout(trunk_out)
+        trunk_out = self.shared_fc(trunk_out)
+        trunk_out = self.gelu(trunk_out)
+
+        return_pred = self.return_head(trunk_out)          # (batch, 1)
+        direction_logits = self.direction_head(trunk_out)  # (batch, n_classes)
+
+        return return_pred, direction_logits
+
+
+# =========================================================
+# PREDICTOR
+# =========================================================
+
+class TCNPredictor:
+
+    def __init__(self, symbol="SPY"):
+
+        symbol = symbol.upper()
+        self.symbol = symbol
+
+        MODEL_PATH = (
+            Path(__file__).parent.parent
+            / "models"
+            / f"best_tcn_{symbol.lower()}.pth"
+        )
+
+        print(f"Loading TCN Model: {MODEL_PATH}")
+
+        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
+
+        # ---- metadata: always prefer whatever the checkpoint saved ----
+        self.indicators = normalize_indicator_list(checkpoint.get("indicators", []))
+        self.indicator_columns = checkpoint.get(
+            "indicator_columns", resolve_indicator_columns(self.indicators)
+        )
+        self.features = checkpoint.get("features", resolve_feature_columns(self.indicators))
+
+        self.sequence_length = checkpoint.get("sequence_length", DEFAULT_SEQUENCE_LENGTH)
+        self.forecast_steps = checkpoint.get("forecast_steps", None)
+
+        self.target_columns = checkpoint.get("target_columns", DEFAULT_TARGET_COLUMNS)
+        self.target_type = checkpoint.get("target_type", DEFAULT_TARGET_TYPE)
+
+        self.direction_classes = checkpoint.get("direction_classes", DEFAULT_DIRECTION_CLASSES)
+        self.direction_threshold = checkpoint.get(
+            "direction_threshold", DEFAULT_DIRECTION_THRESHOLD
+        )
+
+        tcn_num_channels = checkpoint.get("tcn_num_channels", DEFAULT_TCN_NUM_CHANNELS)
+        tcn_kernel_size = checkpoint.get("tcn_kernel_size", DEFAULT_TCN_KERNEL_SIZE)
+        dropout_rate = checkpoint.get("dropout_rate", DEFAULT_DROPOUT_RATE)
+
+        # ---- model: exact TCNDualHead architecture ----
+        self.model = TCNDualHead(
+            n_features=len(self.features),
+            num_channels=tcn_num_channels,
+            kernel_size=tcn_kernel_size,
+            dropout=dropout_rate,
+            n_direction_classes=len(self.direction_classes),
+        ).to(DEVICE)
+
+        state_dict = checkpoint["model_state_dict"]
+
+        try:
+            self.model.load_state_dict(state_dict)
+        except RuntimeError as error:
+            model_keys = set(self.model.state_dict().keys())
+            ckpt_keys = set(state_dict.keys())
+            missing = sorted(model_keys - ckpt_keys)
+            unexpected = sorted(ckpt_keys - model_keys)
+            raise RuntimeError(
+                f"TCNDualHead state_dict mismatch while loading {MODEL_PATH.name}.\n"
+                f"Missing keys (expected by model, absent in checkpoint): {missing}\n"
+                f"Unexpected keys (in checkpoint, not used by model): {unexpected}\n"
+                f"Original error: {error}"
+            ) from error
+
+        self.model.eval()
+
+        # ---- scalers: loaded exactly as saved, never re-fit ----
+        self.feature_scaler = StandardScaler()
+        self.feature_scaler.mean_ = np.asarray(checkpoint["feature_scaler_mean"])
+        self.feature_scaler.scale_ = np.asarray(checkpoint["feature_scaler_scale"])
+        self.feature_scaler.var_ = self.feature_scaler.scale_ ** 2
+        self.feature_scaler.n_features_in_ = len(self.feature_scaler.mean_)
+
+        self.target_scaler = StandardScaler()
+        self.target_scaler.mean_ = np.asarray(checkpoint["target_scaler_mean"])
+        self.target_scaler.scale_ = np.asarray(checkpoint["target_scaler_scale"])
+        self.target_scaler.var_ = self.target_scaler.scale_ ** 2
+        self.target_scaler.n_features_in_ = len(self.target_scaler.mean_)
+
+        self.close_feature_index = checkpoint.get(
+            "close_feature_index",
+            self.features.index("close") if "close" in self.features else DEFAULT_CLOSE_FEATURE_INDEX,
+        )
+        self.open_feature_index = checkpoint.get(
+            "open_feature_index",
+            self.features.index("open") if "open" in self.features else DEFAULT_OPEN_FEATURE_INDEX,
+        )
+
+    # -----------------------------------------------------
+    # Feature prep
+    # -----------------------------------------------------
+
+    def _prepare_features(self, df):
+        df = add_missing_features(df, self.indicators)
+
+        missing_cols = [c for c in self.features if c not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Input data is missing required feature columns: {missing_cols}")
+
+        if len(df) < self.sequence_length:
+            raise ValueError(
+                f"Need at least {self.sequence_length} rows of data, got {len(df)}"
+            )
+
+        return df
+
+    def _scale_features(self, df):
+        scaled_df = df.copy()
+        scaled_df[self.features] = self.feature_scaler.transform(scaled_df[self.features])
+        return scaled_df
+
+    # -----------------------------------------------------
+    # Decoding
+    # -----------------------------------------------------
+
+    def _decode_return(self, scaled_return):
+        mean = self.target_scaler.mean_[0]
+        scale = self.target_scaler.scale_[0]
+        return float(scaled_return * scale + mean)
+
+    def _decode_direction(self, direction_logits):
+        probs = torch.softmax(direction_logits, dim=-1).cpu().numpy()[0]
+        class_index = int(np.argmax(probs))
+        signal = self.direction_classes[class_index]
+        confidence = float(probs[class_index])
+        probabilities = {
+            cls: float(p) for cls, p in zip(self.direction_classes, probs)
+        }
+        return signal, confidence, probabilities
+
+    # -----------------------------------------------------
+    # Single-step recursive return forecast (optional).
+    #
+    # Mirrors TCN_Training.py's multi_step_validation exactly: it does
+    # NOT recompute indicators or re-derive OHLC per step. It decodes
+    # the predicted (scaled) return, converts it to a price, re-scales
+    # that price into the open/close feature slots of a shifted window,
+    # and repeats. This is a return-forecasting approximation only --
+    # it is NOT repeated BUY/HOLD/SELL classification. The direction
+    # head is single-step; use predict()'s top-level signal for that.
+    # -----------------------------------------------------
+
+    def _recursive_return_forecast(self, scaled_df, current_close, steps):
+        current_sequence = (
+            scaled_df[self.features]
+            .iloc[-self.sequence_length:]
+            .values
+            .astype(np.float32)
+            .copy()
+        )
+
+        return_mean = self.target_scaler.mean_[0]
+        return_scale = self.target_scaler.scale_[0]
+
+        close_mean = self.feature_scaler.mean_[self.close_feature_index]
+        close_scale = self.feature_scaler.scale_[self.close_feature_index]
+        open_mean = self.feature_scaler.mean_[self.open_feature_index]
+        open_scale = self.feature_scaler.scale_[self.open_feature_index]
+
+        forecasts = []
+        real_close = current_close
+
+        with torch.no_grad():
+            for _ in range(steps):
+                seq_tensor = (
+                    torch.tensor(current_sequence, dtype=torch.float32)
+                    .unsqueeze(0)
+                    .to(DEVICE)
+                )
+
+                return_pred, _ = self.model(seq_tensor)
+                scaled_ret = float(return_pred.cpu().numpy()[0][0])
+
+                real_return = scaled_ret * return_scale + return_mean
+                real_predicted_price = real_close * (1 + real_return)
+
+                forecasts.append({
+                    "predicted_return": float(real_return),
+                    "predicted_next_open": float(real_predicted_price),
+                })
+
+                pred_open_scaled = (real_predicted_price - open_mean) / open_scale
+                pred_close_scaled = (real_predicted_price - close_mean) / close_scale
+
+                next_sequence = current_sequence.copy()
+                next_sequence[:-1] = next_sequence[1:]
+                next_sequence[-1] = next_sequence[-2]
+                next_sequence[-1][self.open_feature_index] = pred_open_scaled
+                next_sequence[-1][self.close_feature_index] = pred_close_scaled
+
+                current_sequence = next_sequence
+                real_close = real_predicted_price
+
+        return forecasts
+
+    # -----------------------------------------------------
+    # Main entry point
+    # -----------------------------------------------------
+
+    def predict(self, df, future_steps=None):
+        """
+        last 60 candles -> TCNDualHead -> {next-candle return, next-candle
+        SELL/HOLD/BUY}.
+
+        `future_steps` is kept only for backward compatibility with
+        callers that pass it positionally/by keyword. If provided and
+        truthy, an additional 'future_forecast' key is included with a
+        recursive return-only forecast (see _recursive_return_forecast).
+        It does NOT change what 'signal'/'confidence'/'probabilities'
+        mean -- those always describe the single next candle, straight
+        from the trained direction head.
+        """
+        original_df = self._prepare_features(df.copy())
+        scaled_df = self._scale_features(original_df)
+
+        window = (
+            scaled_df[self.features]
+            .iloc[-self.sequence_length:]
+            .values
+            .astype(np.float32)
+        )
+        seq_tensor = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+
+        current_close = float(original_df["close"].iloc[-1])
+
+        with torch.no_grad():
+            return_pred, direction_logits = self.model(seq_tensor)
+
+        scaled_return = float(return_pred.cpu().numpy()[0][0])
+        predicted_return = self._decode_return(scaled_return)
+        predicted_next_open = current_close * (1 + predicted_return)
+
+        signal, confidence, probabilities = self._decode_direction(direction_logits)
+
+        result = {
+            "signal": signal,
+            "confidence": confidence,
+            "probabilities": probabilities,
+            "predicted_return": predicted_return,
+            "predicted_next_open": float(predicted_next_open),
+            "current_close": current_close,
+            "symbol": self.symbol,
+            "sequence_length": self.sequence_length,
+            "indicators": list(self.indicators),
+            "features": list(self.features),
+        }
+
+        if future_steps:
+            result["future_forecast"] = self._recursive_return_forecast(
+                scaled_df, current_close, int(future_steps)
+            )
+            result["future_forecast_note"] = (
+                "Recursive return-only forecast (mirrors TCN_Training.py's "
+                "multi_step_validation approximation). This is not repeated "
+                "BUY/HOLD/SELL classification -- use 'signal'/'confidence'/"
+                "'probabilities' above for the next-candle call."
+            )
+
+        return result
+
+    # -----------------------------------------------------
+    # Historical (single-step, walk-forward) predictions
+    # -----------------------------------------------------
+
+    def historical_predictions(self, df):
+        """
+        Walks every window of `sequence_length` candles through the
+        dual-head model and returns, for each step, the next-candle
+        return/price/signal -- exactly what predict() would have said
+        at that point in history.
+
+        Returns (historical_times, historical_results):
+          - historical_times: list of datetimes the prediction is FOR
+            (i.e. the candle whose open is being predicted)
+          - historical_results: list of dicts with predicted_return,
+            predicted_next_open, signal, confidence, probabilities
+
+        NOTE for callers upgrading from the old predictor: this used to
+        return a flat list of predicted prices as historical_predictions;
+        it now returns a list of dicts (see above), since a single float
+        can't carry the new direction-head output. Existing code that
+        plots price needs to read `entry["predicted_next_open"]` instead
+        of the entry directly.
+        """
+        original_df = self._prepare_features(df.copy())
+
+        if "datetime" not in original_df.columns:
+            raise ValueError("Input dataframe must include a 'datetime' column")
+
+        scaled_df = self._scale_features(original_df)
+
+        historical_times = []
+        historical_results = []
+
+        with torch.no_grad():
+            for i in range(self.sequence_length, len(scaled_df)):
+
+                window = (
+                    scaled_df[self.features]
+                    .iloc[i - self.sequence_length:i]
+                    .values
+                    .astype(np.float32)
+                )
+
+                seq_tensor = (
+                    torch.tensor(window, dtype=torch.float32)
+                    .unsqueeze(0)
+                    .to(DEVICE)
+                )
+
+                return_pred, direction_logits = self.model(seq_tensor)
+
+                scaled_return = float(return_pred.cpu().numpy()[0][0])
+                predicted_return = self._decode_return(scaled_return)
+
+                # last row of the window (index i-1) is "current close"
+                current_close = float(original_df["close"].iloc[i - 1])
+                predicted_next_open = current_close * (1 + predicted_return)
+
+                signal, confidence, probabilities = self._decode_direction(direction_logits)
+
+                historical_times.append(original_df["datetime"].iloc[i])
+                historical_results.append({
+                    "predicted_return": predicted_return,
+                    "predicted_next_open": float(predicted_next_open),
+                    "current_close": current_close,
+                    "signal": signal,
+                    "confidence": confidence,
+                    "probabilities": probabilities,
+                })
+
+        return historical_times, historical_results
