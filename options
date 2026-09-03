@@ -297,8 +297,40 @@ def resolve_indicator_columns(indicators):
 def resolve_feature_columns(indicators):
     """
     FINAL_FEATURES = BASE_FEATURES + Selected_Indicator_Columns
+
+    NOTE: this does NOT include options columns. Options columns are
+    data-dependent (they come from whatever expiry1_/expiry2_/expiry3_
+    columns are actually present in the loaded dataframe), so they are
+    resolved separately by resolve_options_columns() and appended on
+    top of this list inside prepare_training_data().
     """
     return list(BASE_FEATURES) + resolve_indicator_columns(indicators)
+
+
+def resolve_options_columns(dataframe):
+    """
+    Returns every numeric column in `dataframe` whose name starts with
+    expiry1_, expiry2_, expiry3_ -- grouped in that order (all
+    expiry1_* columns first, then expiry2_*, then expiry3_*), with
+    each group's original column order preserved.
+
+    This keeps the final feature order exactly:
+        BASE_FEATURES + indicator_columns + expiry1_* + expiry2_* + expiry3_*
+    as required, and never invents or predicts options values -- it
+    only reads columns that are already present in the source data.
+    """
+    prefixes = ("expiry1_", "expiry2_", "expiry3_")
+    options_columns = []
+
+    for prefix in prefixes:
+        group = [
+            column for column in dataframe.columns
+            if column.startswith(prefix)
+            and pd.api.types.is_numeric_dtype(dataframe[column])
+        ]
+        options_columns.extend(group)
+
+    return options_columns
 
 
 # =========================================================
@@ -486,7 +518,16 @@ class MarketDataset(Dataset):
 # TRAINING CONFIGURATION BANNER
 # =========================================================
 
-def print_training_summary(symbol, indicators, indicator_columns, features):
+def print_training_summary(
+    symbol,
+    indicators,
+    indicator_columns,
+    features,
+    data_source="ftp",
+    options_columns=None
+):
+    options_columns = options_columns or []
+
     print("=========================================")
     print("Training Configuration")
     print("=========================================")
@@ -499,6 +540,19 @@ def print_training_summary(symbol, indicators, indicator_columns, features):
 
     print("\nGenerated Indicator Columns:")
     print(indicator_columns if indicator_columns else [])
+
+    # ---- Options-aware summary (only meaningful for combined local
+    # OHLCV + options training; counts are always the REAL counts
+    # actually found/used, never hardcoded) ----
+    if data_source == "local":
+        print("\nData Source:")
+        print("Local Combined OHLCV + Options")
+
+        print("\nOptions Feature Count:")
+        print(len(options_columns))
+
+        print("\nTotal Model Feature Count:")
+        print(len(features))
 
     print("\nFinal Training Features:")
     print(features)
@@ -537,6 +591,18 @@ def prepare_training_data(symbol, indicators, data_source="ftp", data_path=""):
         for column in dataframe.columns
     ]
 
+    # ---- Validate required OHLCV columns are present ----
+    required_ohlcv_columns = ["datetime", "open", "high", "low", "close", "volume"]
+    missing_ohlcv_columns = [
+        column for column in required_ohlcv_columns
+        if column not in dataframe.columns
+    ]
+
+    if missing_ohlcv_columns:
+        raise RuntimeError(
+            f"Missing required OHLCV columns: {missing_ohlcv_columns}"
+        )
+
     try:
         dataframe["datetime"] = pd.to_datetime(
             dataframe["datetime"],
@@ -553,7 +619,22 @@ def prepare_training_data(symbol, indicators, data_source="ftp", data_path=""):
     # ---- Feature engineering: selected indicators only ----
     dataframe = add_indicators(dataframe, indicators)
     indicator_columns = resolve_indicator_columns(indicators)
-    features = resolve_feature_columns(indicators)
+
+    # ---- Options features: read-only, never predicted/invented.
+    # Only expected (and required) for local combined OHLCV + options
+    # training; for FTP OHLCV-only training this will naturally be
+    # an empty list since no expiry1_/expiry2_/expiry3_ columns exist. ----
+    options_columns = resolve_options_columns(dataframe)
+
+    if data_source == "local" and len(options_columns) == 0:
+        raise RuntimeError(
+            "Local combined training requested, but no expiry1_/expiry2_/expiry3_ "
+            "options features were found."
+        )
+
+    # Final feature order: BASE_FEATURES, then indicator columns, then
+    # expiry1_* / expiry2_* / expiry3_* columns (never reordered).
+    features = resolve_feature_columns(indicators) + options_columns
 
     # ---- Target: ALWAYS target_next_open ----
     dataframe = add_targets(dataframe)
@@ -625,7 +706,8 @@ def prepare_training_data(symbol, indicators, data_source="ftp", data_path=""):
         feature_scaler,
         target_scaler,
         features,
-        indicator_columns
+        indicator_columns,
+        options_columns
     )
 
 
@@ -634,7 +716,9 @@ def prepare_training_data(symbol, indicators, data_source="ftp", data_path=""):
 # The input layer size (n_features) is passed in dynamically from
 # len(features). With the full DEFAULT_INDICATORS set that's:
 #   5 base OHLCV + ema9 + ema20 + ema50 + vwap + rsi14 + atr14
-#   + macd_line + macd_signal + macd_hist = 13 total.
+#   + macd_line + macd_signal + macd_hist = 13 total, plus any
+#   expiry1_/expiry2_/expiry3_ options columns found in the source
+#   data when training on local combined OHLCV + options data.
 #
 # The output layer emits exactly 1 value: target_next_open.
 # =========================================================
@@ -818,13 +902,30 @@ def multi_step_validation(
     X_raw,
     y_raw,
     target_scaler,
-    steps=MULTI_STEP_VALIDATION_STEPS
+    steps=MULTI_STEP_VALIDATION_STEPS,
+    options_columns=None
 ):
     """
     Rolls the model forward `steps` bars, feeding its own next_open
     prediction back in as the next bar's open/close, and measures how
     far off the next_open predictions drift.
+
+    IMPORTANT: this recursive rollout only ever overwrites the
+    open/close slots of BASE_FEATURES (indices 4 and 2). It has no
+    way to produce future expiry1_/expiry2_/expiry3_ options values --
+    doing so would mean inventing fake future options-chain data. So
+    whenever options features are part of the input (options_columns
+    is non-empty), this function is skipped entirely and reports
+    np.nan instead of silently reusing stale, copied-forward options
+    values across the recursive horizon.
     """
+    if options_columns:
+        print(
+            "Multi-step recursive validation skipped because future "
+            "options features are unavailable."
+        )
+        return float(np.nan)
+
     model.eval()
 
     predictions = []
@@ -964,11 +1065,21 @@ def train_model(
         feature_scaler,
         target_scaler,
         features,
-        indicator_columns
-    ) = prepare_training_data(symbol, indicators)
+        indicator_columns,
+        options_columns
+    ) = prepare_training_data(symbol, indicators, data_source, data_path)
+
+    options_present = len(options_columns) > 0
 
     # ---- Print the full pre-training configuration banner ----
-    print_training_summary(symbol, indicators, indicator_columns, features)
+    print_training_summary(
+        symbol,
+        indicators,
+        indicator_columns,
+        features,
+        data_source=data_source,
+        options_columns=options_columns
+    )
 
     huber_loss = nn.HuberLoss()          # single regression target
 
@@ -1112,12 +1223,18 @@ def train_model(
             np.mean(next_open_true_real)
         )
 
+        # ---- One-step validation is always run, unchanged, above.
+        # Multi-step (recursive) validation is skipped internally by
+        # multi_step_validation() whenever options_columns is
+        # non-empty, and returns np.nan in that case instead of
+        # recursively fabricating future options features. ----
         multi_step_mae = multi_step_validation(
             model,
             np.array(X_validation_raw),
             np.array(y_validation_raw),
             target_scaler,
-            steps=MULTI_STEP_VALIDATION_STEPS
+            steps=MULTI_STEP_VALIDATION_STEPS,
+            options_columns=options_columns
         )
 
         mae_list.append(mae)
@@ -1139,6 +1256,14 @@ def train_model(
         print("Target Max     :", np.max(next_open_true_real))
         print("======================================")
 
+        # ---- Safe formatting: multi_step_mae is np.nan whenever
+        # options features are enabled, so it can't go through a
+        # plain ":.6f}" format spec without raising. ----
+        if np.isnan(multi_step_mae):
+            multi_step_mae_display = "N/A (options features enabled)"
+        else:
+            multi_step_mae_display = f"{multi_step_mae:.6f}"
+
         print(f"Epoch [{epoch + 1}] Completed")
         print(f"Train Loss          : {avg_train_loss:.6f}")
         print(f"Val Loss            : {avg_val_loss:.6f}")
@@ -1147,7 +1272,7 @@ def train_model(
         print(f"R\u00b2                  : {r2:.6f}")
         print(f"Correlation         : {corr:.6f}")
         print(f"Confidence Score    : {confidence_score:.2f}%")
-        print(f"Multi-Step MAE      : {multi_step_mae:.6f}")
+        print(f"Multi-Step MAE      : {multi_step_mae_display}")
 
         if progress_callback:
             progress_callback(
@@ -1184,6 +1309,10 @@ def train_model(
 
                     "dropout_rate": DROPOUT_RATE,
                     "multi_step_validation_steps": MULTI_STEP_VALIDATION_STEPS,
+
+                    # ---- Options-feature metadata (new) ----
+                    "options_features_enabled": options_present,
+                    "options_columns": options_columns,
                 },
                 MODEL_PATH
             )
@@ -1202,182 +1331,11 @@ def train_model(
 
 
 if __name__ == "__main__":
-    # Standalone run: trains on OHLCV + EMA9 + EMA20 + EMA50 + VWAP +
-    # RSI14 + ATR14 + MACD (the pipeline's full feature set).
-    train_model(symbol=DEFAULT_SYMBOL, indicators=DEFAULT_INDICATORS)"""Modify ONLY the existing TCN training file.
-
-The combined OHLCV + indicators + options integration is already mostly correct. I only want the remaining fixes. Do NOT modify any other file.
-
-Required changes:
-
-1. Keep the current combined feature set exactly as it is:
-
-OHLCV:
-high
-low
-close
-volume
-open
-
-Technical indicators:
-EMA9
-EMA20
-EMA50
-VWAP
-RSI14
-ATR14
-MACD
-
-Options features:
-all numeric columns starting with:
-expiry1_
-expiry2_
-expiry3_
-
-Expected total:
-5 OHLCV
-+ 9 indicator columns
-+ 102 options columns
-= 116 model features
-
-2. Do NOT change:
-- TCNRegressor
-- TemporalBlock
-- target_next_open
-- SEQUENCE_LENGTH = 60
-- 80/20 split
-- optimizer
-- Huber loss
-- scheduler
-- early stopping
-- epochs
-- learning rate
-- batch size
-- FTP support
-- options_loader.py
-- predictor files
-- signal engine
-- API
-- frontend
-
-3. Fix only the multi_step_validation() issue caused by options features.
-
-Current problem:
-multi_step_validation() recursively creates a new future row by copying:
-
-next_sequence[-1] = next_sequence[-2]
-
-Then it only replaces:
-close at feature index 2
-open at feature index 4
-
-This means the expiry1_*, expiry2_*, expiry3_* options features are copied forward and become stale/repeated during recursive forecasting.
-
-Do NOT invent or predict future options-chain values.
-
-For this training step, multi-step validation must NOT recursively generate fake future options features.
-
-Make the smallest safe change.
-
-Preferred solution:
-- Keep normal one-step validation exactly unchanged.
-- Keep Multi-Step MAE only as an optional diagnostic.
-- If options_columns are present, skip recursive multi-step validation and return/record np.nan for Multi-Step MAE.
-- Print a clear message such as:
-
-"Multi-step recursive validation skipped because future options features are unavailable."
-
-- If there are no options features, preserve the existing multi_step_validation() behavior for normal OHLCV-only training.
-
-4. Pass whether options features are present into the validation logic in the cleanest minimal way.
-
-For example, either:
-- add an options_present/options_columns argument to multi_step_validation()
-or
-- conditionally call it inside train_model().
-
-Prefer the smallest modification.
-
-5. Make metric printing safe when Multi-Step MAE is np.nan.
-
-It should print something like:
-
-Multi-Step MAE      : N/A (options features enabled)
-
-instead of failing formatting.
-
-6. Model checkpoint saving must still work.
-
-When options features are enabled:
-- save multi_step_validation_mae as np.nan or None
-- also save a boolean such as:
-  "options_features_enabled": True
-- save "options_columns": options_columns
-
-Do not remove any existing checkpoint fields.
-
-7. Keep the existing feature order exactly:
-
-BASE_FEATURES
-then technical indicator columns
-then expiry1_* columns
-then expiry2_* columns
-then expiry3_* columns
-
-The first five BASE_FEATURES must remain unchanged because the existing code uses:
-close = index 2
-open = index 4
-
-8. Add validation checks before training:
-
-Confirm these required OHLCV columns exist:
-datetime
-open
-high
-low
-close
-volume
-
-If data_source == "local":
-- confirm options columns were actually found
-- if zero options columns are found, raise a clear RuntimeError instead of silently training without options
-
-Example:
-RuntimeError(
-    "Local combined training requested, but no expiry1_/expiry2_/expiry3_ options features were found."
-)
-
-9. Print this clearly before training:
-
-Data Source:
-Local Combined OHLCV + Options
-
-Options Feature Count:
-102
-
-Total Model Feature Count:
-116
-
-If the actual counts are different, print the real counts. Do not hardcode 102 or 116 into the training logic.
-
-10. Keep the final standalone run as:
-
-train_model(
-    symbol=DEFAULT_SYMBOL,
-    indicators=DEFAULT_INDICATORS,
-    data_source="local",
-    data_path="data/options/OptionsDataAllDteSPY.jsonlines"
-)
-
-Important:
-Do NOT redesign the model.
-Do NOT create future options features.
-Do NOT add new targets.
-Do NOT change target_next_open.
-Do NOT modify another file.
-
-After making the changes, show me only:
-1. the exact sections changed,
-2. confirmation that combined training still uses OHLCV + indicators + 3 expiry option features,
-3. confirmation that normal training/one-step validation is unchanged,
-4. confirmation that recursive Multi-Step MAE is skipped only when options features are enabled."""
+    # Standalone run: trains on the combined local OHLCV + indicators
+    # + expiry1_/expiry2_/expiry3_ options feature set.
+    train_model(
+        symbol=DEFAULT_SYMBOL,
+        indicators=DEFAULT_INDICATORS,
+        data_source="local",
+        data_path="data/options/OptionsDataAllDteSPY.jsonlines"
+    )
