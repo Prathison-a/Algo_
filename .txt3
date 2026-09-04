@@ -1,1636 +1,1273 @@
-Modify my existing `gru_predictor.py` so that it is **100% compatible with my current `GRU_Training.py` checkpoint and training pipeline**.
-
-### IMPORTANT RULES
-
-1. **Do not rewrite unrelated working code.**
-2. Preserve existing:
-
-   * OHLCV loading
-   * datetime handling
-   * indicator generation
-   * StandardScaler usage
-   * 60-candle sequence handling
-   * historical prediction-line generation
-   * prediction-line smoothing
-   * NaN/Inf validation
-   * price conversion logic where applicable
-3. First inspect `GRU_Training.py` and make the predictor match its:
-
-   * GRU architecture
-   * feature list
-   * indicator list
-   * target columns
-   * target type
-   * scaler structure
-   * checkpoint structure
-   * optional feature handling
-   * BUY/HOLD/SELL labels
-4. Do not assume the architecture or checkpoint fields. **Use the actual definitions from `GRU_Training.py`.**
-5. Do not fabricate missing options data with zeros, forward-filled fake values, or random values.
-
----
-
-## 1. LOAD THE EXACT MODEL ARCHITECTURE
-
-Replace the current regression-only model loading if the current training model is a direction + return model.
-
-The predictor must instantiate the **exact same GRU architecture used by `GRU_Training.py`**.
-
-The model must support the training outputs, for example:
-
-```text
-GRU
- ├── Return prediction
- └── Direction prediction
-```
-
-Do not create a different GRU architecture.
-
-The checkpoint's saved configuration must be treated as authoritative wherever appropriate.
-
----
-
-## 2. LOAD CHECKPOINT CONFIGURATION
-
-Load all relevant information from the checkpoint, including whatever is actually saved by `GRU_Training.py`:
-
-* features
-* indicators
-* indicator_columns
-* sequence_length
-* target_columns
-* target_type
-* direction labels
-* direction threshold
-* minimum signal confidence
-* options columns
-* number of features
-* model architecture parameters
-* feature scaler
-* target scaler
-
-Use `.get()` only where backward compatibility is genuinely needed.
-
-Validate that:
-
-```python
-len(self.features)
-```
-
-matches the checkpoint's expected number of features.
-
-If the checkpoint contains options features, preserve them exactly.
-
----
-
-## 3. FEATURE VALIDATION
-
-The predictor must generate the same technical indicators used during training.
-
-After indicators are generated, verify that **every checkpoint feature exists**.
-
-Use logic equivalent to:
-
-```python
-missing_features = [
-    f for f in self.features
-    if f not in df.columns
-]
-
-if missing_features:
-    raise RuntimeError(
-        f"Missing model features: {missing_features}"
-    )
-```
-
-Do not silently create missing features.
-
-For an options-enabled checkpoint, require the actual options columns:
-
-```text
-expiry1_...
-expiry2_...
-expiry3_...
-```
-
-or whatever exact prefixes/columns are defined in `GRU_Training.py`.
-
----
-
-## 4. SUPPORT OPTIONAL FEATURES
-
-The predictor must support both:
-
-### OHLCV + indicators model
-
-```text
-OHLCV
-+
-Technical Indicators
-```
-
-and:
-
-### OHLCV + indicators + options model
-
-```text
-OHLCV
-+
-Technical Indicators
-+
-Expiry 1 Options
-+
-Expiry 2 Options
-+
-Expiry 3 Options
-```
-
-The predictor must automatically determine whether the loaded checkpoint requires options features.
-
-Do not hard-code fake options values.
-
----
-
-## 5. FIX TARGET DECODING
-
-The current model predicts:
-
-```text
-target_next_return
-```
-
-if that is what the current `GRU_Training.py` uses.
-
-The return is:
-
-```python
-(next_open - current_close) / current_close
-```
-
-Therefore decode the scaled prediction using the saved target scaler and calculate:
-
-```python
-predicted_price = (
-    reference_close *
-    (1.0 + predicted_return)
-)
-```
-
-Keep backward compatibility with an older absolute-price checkpoint only if the checkpoint actually contains `target_type="price"`.
-
-Also fix the current bug in the legacy branch.
-
-The correct order is:
-
-```python
-predicted_price = float(pred_value)
-
-predicted_return = (
-    predicted_price / reference_close
-) - 1.0
-```
-
-Do NOT reference `predicted_price` before assigning it.
-
----
-
-## 6. ADD BUY / HOLD / SELL PREDICTION
-
-If the current GRU training model contains a direction/classification head, decode its logits using softmax.
-
-Use the actual label mapping from the checkpoint/training code.
-
-If the training mapping is:
-
-```python
-0 = SELL
-1 = HOLD
-2 = BUY
-```
-
-then use exactly that mapping.
-
-Return:
-
-```python
-signal
-confidence
-probabilities
-```
-
-For example:
-
-```python
-{
-    "signal": "BUY",
-    "confidence": 0.87,
-    "probabilities": {
-        "SELL": 0.05,
-        "HOLD": 0.08,
-        "BUY": 0.87
-    }
-}
-```
-
-Do not independently generate BUY/SELL using EMA crossover or another separate strategy.
-
-**The trained GRU direction output must be the source of the signal.**
-
----
-
-## 7. MINIMUM CONFIDENCE
-
-If `GRU_Training.py` defines:
-
-```python
-MIN_SIGNAL_CONFIDENCE = 0.70
-```
-
-load it from the checkpoint.
-
-If:
-
-```text
-model confidence < 0.70
-```
-
-then the final predictor signal should be:
-
-```text
-HOLD
-```
-
-while preserving the original model probabilities.
-
-Example:
-
-```text
-Model prediction:
-BUY
-confidence = 0.61
-
-Final:
-HOLD
-confidence = 0.61
-```
-
-Do not change the probabilities.
-
----
-
-## 8. RETURN A COMPLETE PREDICTION RESULT
-
-Create a prediction result containing at least:
-
-```python
-{
-    "signal": signal,
-    "confidence": confidence,
-    "probabilities": {
-        "SELL": ...,
-        "HOLD": ...,
-        "BUY": ...
-    },
-    "predicted_return": predicted_return,
-    "predicted_price": predicted_price,
-    "reference_close": reference_close
-}
-```
-
-Also preserve the existing future prediction fields if they are still required by the frontend:
-
-```python
-"future_times"
-"future_predictions"
-```
-
-Make every returned numeric value JSON-safe.
-
-Never return:
-
-```text
-NaN
-Infinity
--Infinity
-numpy.float32
-numpy.int64
-```
-
-Use normal Python `float`/`int` values.
-
----
-
-## 9. OPTIONS + FUTURE FORECASTING
-
-This is critical.
-
-The current predictor recursively creates synthetic future candles:
-
-```text
-prediction
-↓
-synthetic candle
-↓
-prediction
-↓
-synthetic candle
-```
-
-That approach is acceptable only when all required future features can be generated reliably.
-
-If the loaded GRU checkpoint requires options-chain features, **do not fabricate future options data**.
-
-Therefore:
-
-```python
-if self.options_columns and future_steps > 1:
-    raise RuntimeError(
-        "Multi-step recursive forecasting is not supported "
-        "for an options-enabled GRU model because future "
-        "options features are unavailable."
-    )
-```
-
-For an options-enabled model, the normal live inference path should use:
-
-```python
-future_steps = 1
-```
-
-The predictor should use the latest real OHLCV + indicator + options row/sequence.
-
-Do not create fake expiry1/expiry2/expiry3 values.
-
----
-
-## 10. HISTORICAL PREDICTIONS
-
-Keep the existing historical prediction-line functionality.
-
-It should continue to:
-
-```text
-previous 60 real candles
-        ↓
-GRU
-        ↓
-predicted next-open return
-        ↓
-predicted price
-```
-
-Attach the prediction to the next candle timestamp.
-
-Do not allow the historical prediction code to silently drop required options columns.
-
-If the checkpoint requires options features, historical rows must contain those actual options features.
-
----
-
-## 11. FUTURE PREDICTION LINE
-
-Preserve the existing prediction-line functionality for the OHLCV-only model.
-
-Keep:
-
-* interval inference
-* indicator warmup
-* recursive prediction
-* ATR/sanity limits
-* synthetic OHLCV generation
-* smoothing
-
-However, for an options-enabled checkpoint, do not perform recursive multi-step forecasting unless the actual future options data is supplied.
-
-The predictor should clearly raise an error rather than generating fake option features.
-
----
-
-## 12. SMOOTHING
-
-Do not use prediction-line smoothing to determine BUY/SELL/HOLD.
-
-Keep smoothing only for the visualization prediction line.
-
-The signal must come directly from the GRU direction output.
-
-Therefore:
-
-```text
-GRU direction output
-        ↓
-BUY/HOLD/SELL
-```
-
-and separately:
-
-```text
-GRU return output
-        ↓
-predicted price
-        ↓
-optional visualization smoothing
-```
-
-Never smooth the classification probabilities to generate a trading signal.
-
----
-
-## 13. SIGNAL ENGINE COMPATIBILITY
-
-Make the output compatible with the existing backend flow:
-
-```text
-GRUPredictor
-      ↓
-DecisionAgent
-      ↓
-SignalEngine
-```
-
-The predictor should provide the trained-model signal so that the Signal Engine does not independently invent a different BUY/SELL/HOLD signal.
-
-The Signal Engine should be able to validate/pass through:
-
-```text
-signal
-confidence
-probabilities
-predicted_return
-predicted_price
-```
-
-Do not modify `SignalEngine.py` in this task unless absolutely required for compatibility.
-
----
-
-## 14. ERROR HANDLING
-
-Add clear errors for:
-
-* model file missing
-* checkpoint missing required fields
-* feature mismatch
-* missing options features
-* insufficient sequence length
-* invalid scaler dimensions
-* non-finite model output
-* invalid predicted price
-* unsupported multi-step options forecasting
-
-Errors should clearly tell me what is wrong and whether retraining is required.
-
----
-
-## 15. DO NOT CHANGE THE TRAINING MODEL
-
-Do not modify `GRU_Training.py`.
-
-This task is ONLY to modify:
-
-```text
-gru_predictor.py
-```
-
-The predictor must adapt to the existing trained checkpoint.
-
----
-
-## 16. FINAL VALIDATION
-
-After modifying the file, verify all of these:
-
-### Model compatibility
-
-```text
-GRU_Training.py architecture
-        =
-gru_predictor.py architecture
-```
-
-### Features
-
-```text
-Training features
-        =
-Checkpoint features
-        =
-Predictor input features
-```
-
-### Sequence
-
-```text
-60 candles
-```
-
-### Target
-
-```text
-next-open return
-```
-
-### Direction
-
-```text
-SELL / HOLD / BUY
-```
-
-### Options
-
-```text
-Expiry 1
-Expiry 2
-Expiry 3
-```
-
-when required by the checkpoint.
-
-### Output
-
-```text
-signal
-confidence
-probabilities
-predicted_return
-predicted_price
-```
-
-### Important
-
-Do not just provide a conceptual answer.
-
-**Return the complete updated `gru_predictor.py` code**, preserving all existing functionality that does not need to change.
-
-At the end, provide a short list of exactly what was changed and why.
-""""
-
-
-
-
+import warnings
+warnings.filterwarnings("ignore")
+
+from pathlib import Path
+import random
+from ftplib import FTP
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
-import torch
-from pathlib import Path
-from sklearn.preprocessing import StandardScaler
 
-from train.GRU_Training import (
-    GRURegressor,
-    add_indicators,
-    resolve_feature_columns,
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    accuracy_score,
+    precision_score,
+    recall_score,
+    confusion_matrix,
 )
 
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+
+# =========================================================
+# REPRODUCIBILITY
+# =========================================================
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"\nUsing Device: {DEVICE}")
 
 
-class GRUPredictor:
+# =========================================================
+# FTP CONFIG
+# =========================================================
 
-    # ============================================================
-    # CONFIGURATION
-    # ============================================================
+FTP_HOST = "ftp.cavedspace.com"
+FTP_USER = "ftpuser"
+FTP_PASS = "TestUser01!!"
+FTP_ROOT = "/Backup"
 
-    # Must match GRU training
-    DEFAULT_SEQUENCE_LENGTH = 60
+DEFAULT_SYMBOL = "SPY"
 
-    # Light prediction-line smoothing
-    # 0.25 = light smoothing
-    # Higher = more responsive / less smoothing
-    # Lower = smoother / more lag
-    SMOOTHING_ALPHA = 0.25
 
-    def __init__(self, symbol="SPY"):
+# =========================================================
+# TRAINING CONFIG
+# =========================================================
 
-        symbol = symbol.upper()
+SEQUENCE_LENGTH = 60
+BATCH_SIZE = 128
+EPOCHS = 50
+LEARNING_RATE = 0.0001
+WEIGHT_DECAY = 1e-6
+PATIENCE = 10
+DROPOUT_RATE = 0.2
 
-        model_path = (
-            Path(__file__).parent.parent
-            / "models"
-            / f"best_gru_{symbol.lower()}.pth"
-        )
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
 
-        print(f"Loading GRU Model: {model_path}")
+# GRU architecture config (pipeline: 60 candles -> GRU -> % return + direction)
+GRU_HIDDEN_SIZE = 128
+GRU_NUM_LAYERS = 2
 
-        if not model_path.exists():
-            raise FileNotFoundError(
-                f"GRU model not found: {model_path}"
-            )
+MULTI_STEP_VALIDATION_STEPS = 10
+FORECAST_STEPS = MULTI_STEP_VALIDATION_STEPS
 
-        checkpoint = torch.load(
-            model_path,
-            map_location=DEVICE,
-            weights_only=False,
-        )
+DEFAULT_INDICATORS = [
+    "EMA9",
+    "EMA20",
+    "EMA50",
+    "VWAP",
+    "RSI14",
+    "ATR14",
+    "MACD",
+]
 
-        # ========================================================
-        # CHECKPOINT CONFIG
-        # ========================================================
+BASE_FEATURES = [
+    "high",
+    "low",
+    "close",
+    "volume",
+    "open",
+]
 
-        self.features = checkpoint["features"]
+# Fixed positions of close/open within BASE_FEATURES -- used both here
+# and by the predictor to unscale/rescale price when converting a
+# predicted % return back into a price, and back into a synthetic bar.
+CLOSE_FEATURE_INDEX = 2
+OPEN_FEATURE_INDEX = 4
 
-        self.indicators = checkpoint.get(
-            "indicators",
-            [],
-        )
+INDICATOR_COLUMN_MAP = {
+    "EMA9":  ["ema9"],
+    "EMA20": ["ema20"],
+    "EMA50": ["ema50"],
+    "VWAP":  ["vwap"],
+    "RSI14": ["rsi14"],
+    "ATR14": ["atr14"],
+    "MACD":  ["macd_line", "macd_signal", "macd_hist"],
+}
 
-        self.indicator_columns = checkpoint.get(
-            "indicator_columns",
-            [],
-        )
+# ---------------------------------------------------------
+# TARGETS
+#
+# Two targets are produced from the same underlying quantity:
+#
+#   1) target_next_return (regression)
+#        (next_open - current_close) / current_close
+#        Kept centered near zero and scale-independent from the
+#        instrument's price level -- important for the recursive
+#        multi-step forecaster below.
+#
+#   2) target_direction (classification)
+#        A discretized BUY/HOLD/SELL label derived from
+#        target_next_return using DIRECTION_THRESHOLD:
+#            SELL = 0   (return < -DIRECTION_THRESHOLD)
+#            HOLD = 1   (|return| <= DIRECTION_THRESHOLD)
+#            BUY  = 2   (return >  DIRECTION_THRESHOLD)
+#
+# The regression target continues to be StandardScaler-transformed
+# via target_scaler. The direction target is NEVER scaled -- it stays
+# an integer class label so it can be fed directly into
+# CrossEntropyLoss.
+# ---------------------------------------------------------
+RETURN_TARGET_COLUMN = "target_next_return"
+DIRECTION_TARGET_COLUMN = "target_direction"
 
-        self.sequence_length = checkpoint.get(
-            "sequence_length",
-            self.DEFAULT_SEQUENCE_LENGTH,
-        )
+DIRECTION_THRESHOLD = 0.0015
 
-        self.target_columns = checkpoint.get(
-            "target_columns",
-            ["target_next_return"],
-        )
+# SELL = 0, HOLD = 1, BUY = 2
+DIRECTION_LABELS = {0: "SELL", 1: "HOLD", 2: "BUY"}
 
-        # --------------------------------------------------------
-        # TARGET TYPE
-        #
-        # Current GRU model:
-        #
-        # target_next_return =
-        # (next_open - current_close) / current_close
-        #
-        # Therefore:
-        #
-        # predicted_price =
-        # current_close * (1 + predicted_return)
-        #
-        # Older checkpoints may contain "price".
-        # --------------------------------------------------------
+# Minimum softmax probability required before a raw BUY/SELL signal is
+# trusted -- anything under this confidence is reported as HOLD.
+MIN_SIGNAL_CONFIDENCE = 0.70
 
-        self.target_type = checkpoint.get(
-            "target_type",
-            "price",
-        )
+TARGET_COLUMNS = [
+    RETURN_TARGET_COLUMN,
+    DIRECTION_TARGET_COLUMN,
+]
+TARGET_TYPE = "return"   # decoded by the predictor: price = close * (1 + return)
 
-        # ========================================================
-        # VALIDATE FEATURE CONFIGURATION
-        # ========================================================
+feature_scaler = StandardScaler()
+target_scaler = StandardScaler()   # fit ONLY on target_next_return (the direction
+                                    # target is never passed through this scaler)
 
-        expected_features = resolve_feature_columns(
-            self.indicators
-        )
 
-        if expected_features != self.features:
+# =========================================================
+# INDICATOR NAME NORMALIZATION
+# =========================================================
 
-            raise RuntimeError(
-                "Checkpoint feature configuration does not match "
-                "current GRU_Training.py.\n"
-                f"Checkpoint features: {self.features}\n"
-                f"Expected features:   {expected_features}\n"
-                "Retrain the GRU model."
-            )
+def normalize_indicator_name(name):
+    cleaned = str(name).strip().upper()
+    cleaned = cleaned.replace("_", " ").replace("-", " ")
+    cleaned = " ".join(cleaned.split())
+    no_space = cleaned.replace(" ", "")
 
-        # ========================================================
-        # MODEL
-        # ========================================================
+    for canonical in INDICATOR_COLUMN_MAP.keys():
+        if canonical.upper().replace(" ", "") == no_space:
+            return canonical
 
-        self.model = GRURegressor(
-            n_features=len(self.features)
-        ).to(DEVICE)
+    raise ValueError(
+        f"Unknown indicator '{name}'. This pipeline only supports: "
+        f"{list(INDICATOR_COLUMN_MAP.keys())}"
+    )
 
-        self.model.load_state_dict(
-            checkpoint["model_state_dict"]
-        )
 
-        self.model.eval()
+def normalize_indicator_list(indicators):
+    normalized = []
+    for raw_name in indicators:
+        canonical = normalize_indicator_name(raw_name)
+        if canonical not in normalized:
+            normalized.append(canonical)
+    return normalized
 
-        # ========================================================
-        # FEATURE SCALER
-        # ========================================================
 
-        self.feature_scaler = StandardScaler()
+# =========================================================
+# INDICATORS (unchanged from prior pipeline)
+# =========================================================
 
-        self.feature_scaler.mean_ = np.asarray(
-            checkpoint["feature_scaler_mean"],
-            dtype=np.float64,
-        )
+def compute_rsi(close, period=RSI_PERIOD):
+    delta = close.diff()
 
-        self.feature_scaler.scale_ = np.asarray(
-            checkpoint["feature_scaler_scale"],
-            dtype=np.float64,
-        )
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-        self.feature_scaler.n_features_in_ = len(
-            self.features
-        )
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
-        self.feature_scaler.var_ = (
-            self.feature_scaler.scale_ ** 2
-        )
+    rs = avg_gain / avg_loss.replace(0, np.nan)
 
-        # ========================================================
-        # TARGET SCALER
-        # ========================================================
+    return 100 - (100 / (1 + rs))
 
-        self.target_scaler = StandardScaler()
 
-        self.target_scaler.mean_ = np.asarray(
-            checkpoint["target_scaler_mean"],
-            dtype=np.float64,
-        )
+def compute_atr(dataframe, period=ATR_PERIOD):
+    high_low = dataframe["high"] - dataframe["low"]
+    high_close = (dataframe["high"] - dataframe["close"].shift()).abs()
+    low_close = (dataframe["low"] - dataframe["close"].shift()).abs()
 
-        self.target_scaler.scale_ = np.asarray(
-            checkpoint["target_scaler_scale"],
-            dtype=np.float64,
-        )
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
 
-        self.target_scaler.n_features_in_ = len(
-            self.target_columns
-        )
+    return true_range.ewm(alpha=1 / period, adjust=False).mean()
 
-        self.target_scaler.var_ = (
-            self.target_scaler.scale_ ** 2
-        )
 
-        # ========================================================
-        # INFORMATION
-        # ========================================================
+def compute_vwap(dataframe):
+    typical_price = (dataframe["high"] + dataframe["low"] + dataframe["close"]) / 3
+    cumulative_pv = (typical_price * dataframe["volume"]).cumsum()
+    cumulative_volume = dataframe["volume"].cumsum().replace(0, np.nan)
 
-        print("========================================")
-        print("GRU Predictor Loaded")
-        print("========================================")
-        print(f"Features       : {self.features}")
-        print(f"Indicators     : {self.indicators}")
-        print(f"Sequence Length: {self.sequence_length}")
-        print(f"Target Columns : {self.target_columns}")
-        print(f"Target Type    : {self.target_type}")
-        print(
-            f"Smoothing Alpha: {self.SMOOTHING_ALPHA}"
-        )
-        print("========================================")
+    return cumulative_pv / cumulative_volume
 
-    # ============================================================
-    # FEATURE FRAME
-    # ============================================================
 
-    def _build_feature_frame(self, raw_df):
+def compute_macd(dataframe, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
+    ema_fast = dataframe["close"].ewm(span=fast, adjust=False).mean()
+    ema_slow = dataframe["close"].ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
 
-        df = raw_df.copy()
+    return pd.DataFrame({
+        "macd_line":   macd_line,
+        "macd_signal": signal_line,
+        "macd_hist":   macd_line - signal_line,
+    })
 
-        if "datetime" not in df.columns:
-            raise ValueError(
-                "Input dataframe must contain 'datetime'."
-            )
 
-        df["datetime"] = pd.to_datetime(
-            df["datetime"]
-        )
+INDICATOR_REGISTRY = {
+    "EMA9":  lambda df: df["close"].ewm(span=9, adjust=False).mean(),
+    "EMA20": lambda df: df["close"].ewm(span=20, adjust=False).mean(),
+    "EMA50": lambda df: df["close"].ewm(span=50, adjust=False).mean(),
+    "VWAP":  lambda df: compute_vwap(df),
+    "RSI14": lambda df: compute_rsi(df["close"], period=RSI_PERIOD),
+    "ATR14": lambda df: compute_atr(df, period=ATR_PERIOD),
+    "MACD":  lambda df: compute_macd(df, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL),
+}
 
-        df = (
-            df
-            .sort_values("datetime")
-            .reset_index(drop=True)
-        )
 
-        required = [
-            "datetime",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
+def add_indicators(dataframe, indicators):
+    dataframe = dataframe.copy()
+
+    for name in indicators:
+        if name not in INDICATOR_REGISTRY:
+            raise ValueError(f"Unknown indicator: {name}")
+
+        result = INDICATOR_REGISTRY[name](dataframe)
+
+        if isinstance(result, pd.DataFrame):
+            for col in result.columns:
+                dataframe[col] = result[col]
+        else:
+            dataframe[INDICATOR_COLUMN_MAP[name][0]] = result
+
+    return dataframe
+
+
+def resolve_indicator_columns(indicators):
+    columns = []
+    for name in indicators:
+        columns.extend(INDICATOR_COLUMN_MAP[name])
+    return columns
+
+
+def resolve_feature_columns(indicators):
+    """
+    FINAL_FEATURES = BASE_FEATURES + Selected_Indicator_Columns
+
+    NOTE: this does NOT include options columns. Options columns are
+    data-dependent (they come from whatever expiry1_/expiry2_/expiry3_
+    columns are actually present in the loaded dataframe), so they are
+    resolved separately by resolve_options_columns() and appended on
+    top of this list inside prepare_training_data().
+    """
+    return list(BASE_FEATURES) + resolve_indicator_columns(indicators)
+
+
+def resolve_options_columns(dataframe):
+    """
+    Returns every numeric column in `dataframe` whose name starts with
+    expiry1_, expiry2_, expiry3_ -- grouped in that order (all
+    expiry1_* columns first, then expiry2_*, then expiry3_*), with
+    each group's original column order preserved.
+
+    This keeps the final feature order exactly:
+        BASE_FEATURES + indicator_columns + expiry1_* + expiry2_* + expiry3_*
+    as required, and never invents or predicts options values -- it
+    only reads columns that are already present in the source data.
+    """
+    prefixes = ("expiry1_", "expiry2_", "expiry3_")
+    options_columns = []
+
+    for prefix in prefixes:
+        group = [
+            column for column in dataframe.columns
+            if column.startswith(prefix)
+            and pd.api.types.is_numeric_dtype(dataframe[column])
         ]
+        options_columns.extend(group)
 
-        missing = [
-            c
-            for c in required
-            if c not in df.columns
-        ]
+    return options_columns
 
-        if missing:
-            raise ValueError(
-                f"Missing required columns: {missing}"
-            )
 
-        # Generate exactly the same indicators used during training
-        df = add_indicators(
-            df,
-            self.indicators,
-        )
+# =========================================================
+# PREDICTION TARGETS -- % return, plus a discretized BUY/HOLD/SELL
+# direction label derived from that same % return.
+# =========================================================
 
-        df = (
-            df
-            .replace([np.inf, -np.inf], np.nan)
-            .dropna()
-            .reset_index(drop=True)
-        )
+def add_targets(dataframe):
+    """
+    target_next_return = (next_open - current_close) / current_close
 
+    This is the % move from "where we are now" (this bar's close) to
+    "where the next bar opens" -- the quantity the GRU's return head
+    is trained to predict. Converting back to price at inference time
+    is just:
+        predicted_price = current_close * (1 + predicted_return)
+
+    target_direction is derived from target_next_return using
+    DIRECTION_THRESHOLD:
+        SELL = 0   if target_next_return < -DIRECTION_THRESHOLD
+        BUY  = 2   if target_next_return >  DIRECTION_THRESHOLD
+        HOLD = 1   otherwise
+
+    Rows where target_next_return is NaN (the final row, from the
+    shift(-1)) default to HOLD here and are subsequently dropped by
+    the dropna() step in prepare_training_data(), so they never reach
+    training.
+    """
+    dataframe = dataframe.copy()
+
+    next_open = dataframe["open"].shift(-1)
+    dataframe["target_next_return"] = (next_open - dataframe["close"]) / dataframe["close"]
+
+    dataframe["target_direction"] = 1
+    dataframe.loc[dataframe["target_next_return"] > DIRECTION_THRESHOLD, "target_direction"] = 2
+    dataframe.loc[dataframe["target_next_return"] < -DIRECTION_THRESHOLD, "target_direction"] = 0
+    dataframe["target_direction"] = dataframe["target_direction"].astype(np.int64)
+
+    return dataframe
+
+
+# =========================================================
+# FTP DATA LOADING (unchanged)
+# =========================================================
+
+def get_file_name(symbol):
+    return f"OHLCV{symbol}.txt"
+
+
+def connect_ftp():
+    ftp = FTP(FTP_HOST, timeout=60)
+    ftp.login(user=FTP_USER, passwd=FTP_PASS)
+    ftp.set_pasv(True)
+    return ftp
+
+
+def load_symbol_data(symbol, data_source="ftp", data_path=""):
+    if data_source == "local":
+        print(f"Training on local options data: {data_path}")
+        import sys
+        sys.path.append(str(Path(__file__).resolve().parent.parent))
+        from data.options_loader import load_local_options
+        df = load_local_options(data_path)
         return df
 
-    # ============================================================
-    # TIMEFRAME
-    # ============================================================
+    first_ftp = connect_ftp()
+    first_ftp.cwd(FTP_ROOT)
 
-    def _infer_bar_interval(self, df):
+    folders = first_ftp.nlst()
 
-        diffs = (
-            pd.to_datetime(df["datetime"])
-            .diff()
-            .dropna()
+    try:
+        first_ftp.quit()
+    except:
+        first_ftp.close()
+
+    date_folders = sorted([f for f in folders if f.startswith("202")])
+    usable_folders = date_folders[:-1]
+    all_dataframes = []
+
+    for folder in usable_folders:
+        ftp = None
+
+        try:
+            print(f"\nLoading {folder}")
+
+            ftp = connect_ftp()
+
+            folder_path = f"{FTP_ROOT}/{folder}/{symbol}"
+            file_name = get_file_name(symbol)
+            file_path = f"{folder_path}/{file_name}"
+
+            buffer = BytesIO()
+            ftp.retrbinary(f"RETR {file_path}", buffer.write)
+            buffer.seek(0)
+
+            dataframe = pd.read_csv(buffer)
+            all_dataframes.append(dataframe)
+
+            print("Loaded Successfully")
+
+        except Exception as error:
+            print(f"Skipping {folder}: {error}")
+
+        finally:
+            if ftp is not None:
+                try:
+                    ftp.quit()
+                except:
+                    try:
+                        ftp.close()
+                    except:
+                        pass
+
+    if not all_dataframes:
+        raise RuntimeError(f"No data found for symbol {symbol}")
+
+    return pd.concat(all_dataframes, ignore_index=True)
+
+
+# =========================================================
+# SEQUENCE CREATION (unchanged mechanics -- targets now include both
+# the return column and the direction column, in that order)
+# =========================================================
+
+def create_sequences(dataframe, features, targets=TARGET_COLUMNS):
+    feature_array = dataframe[features].to_numpy(dtype=np.float32)
+    target_array = dataframe[targets].to_numpy(dtype=np.float32)
+
+    X = []
+    y = []
+
+    for index in range(SEQUENCE_LENGTH, len(dataframe)):
+        X.append(feature_array[index - SEQUENCE_LENGTH:index])
+        y.append(target_array[index - 1])
+
+    return (
+        np.array(X, dtype=np.float32),
+        np.array(y, dtype=np.float32)
+    )
+
+
+class MarketDataset(Dataset):
+
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, index):
+        return self.X[index], self.y[index]
+
+
+# =========================================================
+# TRAINING CONFIGURATION BANNER
+# =========================================================
+
+def print_training_summary(
+    symbol,
+    indicators,
+    indicator_columns,
+    features,
+    data_source="ftp",
+    options_columns=None
+):
+    options_columns = options_columns or []
+
+    print("=========================================")
+    print("Training Configuration")
+    print("=========================================")
+
+    print("Base Features:")
+    print(BASE_FEATURES)
+
+    print("\nSelected Training Indicators:")
+    print(indicators if indicators else [])
+
+    print("\nGenerated Indicator Columns:")
+    print(indicator_columns if indicator_columns else [])
+
+    if data_source == "local":
+        print("\nData Source:")
+        print("Local Combined OHLCV + Options")
+
+    # ---- Explicit feature-count breakdown. Counts are always the
+    # REAL counts actually found/used (never hardcoded to 5/9/102/116),
+    # so this stays correct regardless of which indicators are
+    # selected or how many options columns the source data contains. ----
+    print("\nOHLCV Feature Count:")
+    print(len(BASE_FEATURES))
+
+    print("\nIndicator Feature Count:")
+    print(len(indicator_columns) if indicator_columns else 0)
+
+    print("\nOptions Feature Count:")
+    print(len(options_columns))
+
+    print("\nTotal Model Feature Count:")
+    print(len(features))
+
+    print("\nFinal Training Features:")
+    print(features)
+
+    print("\nTotal Features:")
+    print(len(features))
+
+    print("\nTargets:")
+    print(f"Return Target    : {RETURN_TARGET_COLUMN} (type={TARGET_TYPE}, scaled=True)")
+    print(f"Direction Target : {DIRECTION_TARGET_COLUMN} "
+          f"(threshold={DIRECTION_THRESHOLD}, scaled=False, labels={DIRECTION_LABELS})")
+
+    print("\nSequence Length:")
+    print(SEQUENCE_LENGTH)
+
+    print("\nForecast Steps:")
+    print(FORECAST_STEPS)
+
+    print("=========================================")
+    print(f"Model  : GRU (dual-head: return + direction)")
+    print(f"Symbol : {symbol}")
+    print("=========================================")
+    print("Training Started...")
+    print("=========================================\n")
+
+
+# =========================================================
+# PREPARE TRAINING DATA
+# =========================================================
+
+def prepare_training_data(symbol, indicators, data_source="ftp", data_path=""):
+    dataframe = load_symbol_data(symbol, data_source, data_path)
+
+    print(f"\nMerged Shape: {dataframe.shape}")
+
+    dataframe.columns = [c.lower().strip() for c in dataframe.columns]
+
+    try:
+        dataframe["datetime"] = pd.to_datetime(dataframe["datetime"], unit="ms")
+    except:
+        dataframe["datetime"] = pd.to_datetime(dataframe["datetime"])
+
+    dataframe = dataframe.sort_values("datetime")
+    dataframe.reset_index(drop=True, inplace=True)
+
+    dataframe = add_indicators(dataframe, indicators)
+    indicator_columns = resolve_indicator_columns(indicators)
+
+    # ---- Options features: read-only, never predicted/invented.
+    # Only expected (and required) for local combined OHLCV + options
+    # training; for FTP OHLCV-only training this will naturally be
+    # an empty list since no expiry1_/expiry2_/expiry3_ columns exist. ----
+    options_columns = resolve_options_columns(dataframe)
+
+    # Final feature order: BASE_FEATURES, then indicator columns, then
+    # expiry1_* / expiry2_* / expiry3_* columns (never reordered).
+    features = resolve_feature_columns(indicators) + options_columns
+
+    if data_source == "local":
+        if len(options_columns) == 0:
+            raise RuntimeError(
+                "Local combined training requested, but no expiry1_/expiry2_/expiry3_ "
+                "options features were found."
+            )
+
+        if len(options_columns) != 102:
+            raise RuntimeError(
+                f"Expected 102 options features, found {len(options_columns)}"
+            )
+
+        if len(features) != 116:
+            raise RuntimeError(
+                f"Expected 116 total model features, found {len(features)}"
+            )
+
+    dataframe = add_targets(dataframe)
+
+    dataframe.dropna(inplace=True)
+    dataframe.reset_index(drop=True, inplace=True)
+
+    print("\n========== DATASET DIAGNOSTICS ==========")
+    print("Rows after dropna:", len(dataframe))
+    print("Total features:", len(features))
+    print("Options features:", len(options_columns))
+    print("\nTarget Statistics (target_next_return):")
+    print(dataframe["target_next_return"].describe())
+    print("\nDirection Label Distribution (target_direction):")
+    print(
+        dataframe["target_direction"]
+        .map(DIRECTION_LABELS)
+        .value_counts()
+    )
+    print("\nOptions Feature Variation:")
+    constant_options = [
+        col for col in options_columns
+        if dataframe[col].nunique() <= 1
+    ]
+    print("Constant options columns:", len(constant_options))
+    if constant_options:
+        print("Constant columns:")
+        print(constant_options)
+    print("\nOptions NaN count:")
+    print(dataframe[options_columns].isna().sum().sum())
+    print("==========================================")
+
+    split_index = int(len(dataframe) * 0.80)
+
+    train_dataframe = dataframe.iloc[:split_index].copy()
+    test_dataframe = dataframe.iloc[split_index:].copy()
+
+    train_dataframe[features] = feature_scaler.fit_transform(train_dataframe[features])
+    test_dataframe[features] = feature_scaler.transform(test_dataframe[features])
+
+    # ---- Only the return target is ever passed through target_scaler.
+    # target_direction stays as an untouched integer class label. ----
+    train_dataframe[[RETURN_TARGET_COLUMN]] = target_scaler.fit_transform(
+        train_dataframe[[RETURN_TARGET_COLUMN]]
+    )
+    test_dataframe[[RETURN_TARGET_COLUMN]] = target_scaler.transform(
+        test_dataframe[[RETURN_TARGET_COLUMN]]
+    )
+
+    X_train, y_train = create_sequences(train_dataframe, features)
+    X_test, y_test = create_sequences(test_dataframe, features)
+
+    if len(X_train) == 0:
+        raise RuntimeError("Training dataset is empty")
+
+    if len(X_test) == 0:
+        raise RuntimeError("Validation dataset is empty")
+
+    print(f"\nTrain Shape: {X_train.shape}")
+    print(f"Test Shape : {X_test.shape}")
+
+    train_dataset = MarketDataset(X_train, y_train)
+    test_dataset = MarketDataset(X_test, y_test)
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    return (
+        train_loader,
+        test_loader,
+        feature_scaler,
+        target_scaler,
+        features,
+        indicator_columns,
+        options_columns
+    )
+
+
+# =========================================================
+# GRU MODEL
+#
+# Pipeline: 60 candles -> GRU -> shared dense layer -> two heads:
+#   - return_head:    1 value  (scaled % return of next-bar open
+#                      relative to current close)
+#   - direction_head: 3 logits (SELL / HOLD / BUY)
+#
+# n_features scales with however many indicators are selected (5 base
+# OHLCV + whichever indicator columns are on = 14 with the full
+# DEFAULT_INDICATORS set, since MACD alone expands to 3 columns),
+# plus any expiry1_/expiry2_/expiry3_ options columns found in the
+# source data when training on local combined OHLCV + options data
+# (14 + 102 = 116). The GRU backbone itself (60-step sequence length,
+# hidden size 128, 2 layers, dropout 0.2, single dense layer) is
+# unchanged from the original single-head regressor -- only the final
+# output layer is split into the two heads above.
+# =========================================================
+
+class GRURegressor(nn.Module):
+
+    def __init__(self, n_features, hidden_size=GRU_HIDDEN_SIZE, num_layers=GRU_NUM_LAYERS):
+        super().__init__()
+
+        self.gru = nn.GRU(
+            input_size=n_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=DROPOUT_RATE if num_layers > 1 else 0.0,
         )
 
-        if len(diffs) == 0:
-            return pd.Timedelta(minutes=1)
+        self.dropout = nn.Dropout(DROPOUT_RATE)
+        self.fc1 = nn.Linear(hidden_size, 64)
+        self.gelu = nn.GELU()
 
-        interval = diffs.median()
+        # Dual heads, both fed from the same 64-unit dense layer.
+        self.return_head = nn.Linear(64, 1)
+        self.direction_head = nn.Linear(64, 3)
 
-        if not isinstance(interval, pd.Timedelta):
-            interval = pd.Timedelta(minutes=1)
+    def forward(self, x):
+        output, _ = self.gru(x)
 
-        return interval
+        # Last timestep's hidden state summarizes the full 60-candle window.
+        output = output[:, -1, :]
 
-    # ============================================================
-    # MODEL PREDICTION
-    #
-    # EXACT PIPELINE:
-    #
-    # 60 candles
-    #      ↓
-    # GRU
-    #      ↓
-    # scaled next-open return
-    #      ↓
-    # inverse scale
-    #      ↓
-    # real next-open return
-    #      ↓
-    # current close × (1 + return)
-    #      ↓
-    # predicted price
-    # ============================================================
+        output = self.dropout(output)
+        output = self.fc1(output)
+        output = self.gelu(output)
 
-    def _predict_from_feature_window(
-        self,
-        feature_window,
-    ):
+        predicted_return = self.return_head(output)      # shape: (batch, 1)
+        direction_logits = self.direction_head(output)   # shape: (batch, 3)
 
-        if len(feature_window) < self.sequence_length:
-            raise RuntimeError(
-                f"Need {self.sequence_length} candles, "
-                f"but only {len(feature_window)} are available."
-            )
+        return predicted_return, direction_logits
 
-        # --------------------------------------------------------
-        # Take exactly the last 60 candles
-        # --------------------------------------------------------
 
-        window_df = (
-            feature_window[
-                self.features
-            ]
-            .iloc[-self.sequence_length:]
-        )
+# =========================================================
+# PREDICTION DECODING -- turns raw model outputs into the standard
+# BUY/HOLD/SELL signal payload, applying the confidence floor.
+# =========================================================
 
-        values = window_df.values.astype(
-            np.float32
-        )
+def decode_prediction(predicted_return, direction_logits, target_scaler):
+    """
+    predicted_return : tensor/array of shape (1, 1) -- scaled return
+                        output from GRURegressor's return_head.
+    direction_logits : tensor/array of shape (1, 3) -- raw logits
+                        from GRURegressor's direction_head.
+    target_scaler     : the StandardScaler fit on target_next_return.
 
-        if len(values) != self.sequence_length:
-            raise RuntimeError(
-                f"Invalid sequence length: "
-                f"{len(values)} != "
-                f"{self.sequence_length}"
-            )
-
-        # --------------------------------------------------------
-        # IMPORTANT:
-        #
-        # Capture the REAL unscaled close BEFORE scaling.
-        #
-        # The return is:
-        #
-        # (next_open - current_close) / current_close
-        #
-        # Therefore current_close is the price anchor.
-        # --------------------------------------------------------
-
-        reference_close = float(
-            feature_window["close"].iloc[-1]
-        )
-
-        if not np.isfinite(reference_close):
-            raise RuntimeError(
-                "Reference close is not finite."
-            )
-
-        if reference_close <= 0:
-            raise RuntimeError(
-                f"Invalid reference close: {reference_close}"
-            )
-
-        # --------------------------------------------------------
-        # Scale the 60-candle input
-        # --------------------------------------------------------
-
-        scaled = self.feature_scaler.transform(
-            values
-        )
-
-        tensor = (
-            torch.tensor(
-                scaled,
-                dtype=torch.float32,
-            )
-            .unsqueeze(0)
-            .to(DEVICE)
-        )
-
-        # --------------------------------------------------------
-        # GRU PREDICTION
-        # --------------------------------------------------------
-
-        with torch.no_grad():
-
-            output = self.model(tensor)
-
-        pred_scaled = float(
-            output
-            .detach()
-            .cpu()
-            .numpy()
-            .reshape(-1)[0]
-        )
-
-        if not np.isfinite(pred_scaled):
-            raise RuntimeError(
-                "GRU returned a non-finite prediction."
-            )
-
-        # ========================================================
-        # DECODE TARGET
-        # ========================================================
-
-        pred_value = (
-            self.target_scaler
-            .inverse_transform(
-                np.array(
-                    [[pred_scaled]],
-                    dtype=np.float64,
-                )
-            )[0, 0]
-        )
-
-        if not np.isfinite(pred_value):
-            raise RuntimeError(
-                "Decoded GRU prediction is not finite."
-            )
-
-        # ========================================================
-        # RETURN → PRICE
-        # ========================================================
-
-        if self.target_type == "return":
-
-            predicted_return = float(
-                pred_value
-            )
-
-            # ----------------------------------------------------
-            # CORE CONVERSION:
-            #
-            # predicted price =
-            # current close × (1 + predicted return)
-            # ----------------------------------------------------
-
-            predicted_price = (
-                reference_close
-                * (1.0 + predicted_return)
-            )
-
-        else:
-
-            # Legacy absolute-price model
-            predicted_return = (
-                predicted_price / reference_close
-            ) - 1.0
-
-            predicted_price = float(
-                pred_value
-            )
-
-        if not np.isfinite(predicted_price):
-            raise RuntimeError(
-                "Predicted price is not finite."
-            )
-
-        if predicted_price <= 0:
-            raise RuntimeError(
-                f"Invalid predicted price: "
-                f"{predicted_price}"
-            )
-
-        return {
-            "predicted_price": float(
-                predicted_price
-            ),
-            "predicted_return": float(
-                predicted_return
-            ),
-            "reference_close": float(
-                reference_close
-            ),
+    Returns:
+        {
+            "signal": "BUY" | "HOLD" | "SELL",
+            "confidence": float,
+            "probabilities": {"SELL": .., "HOLD": .., "BUY": ..},
+            "predicted_return": float
         }
 
-    # ============================================================
-    # LIGHT SMOOTHING
-    #
-    # EMA-style smoothing.
-    #
-    # alpha = 0.25
-    #
-    # new_smoothed =
-    # alpha × prediction
-    # +
-    # (1-alpha) × previous_smoothed
-    #
-    # This is intentionally LIGHT.
-    # ============================================================
+    The raw argmax class is only used as the signal when its softmax
+    probability is >= MIN_SIGNAL_CONFIDENCE; otherwise the signal is
+    forced to HOLD.
+    """
+    if isinstance(direction_logits, torch.Tensor):
+        direction_logits_tensor = direction_logits.detach().cpu()
+    else:
+        direction_logits_tensor = torch.tensor(direction_logits, dtype=torch.float32)
 
-    @classmethod
-    def _smooth_prediction(
-        cls,
-        values,
-        alpha=None,
-    ):
+    probabilities = torch.softmax(direction_logits_tensor, dim=-1).numpy().reshape(-1)
 
-        if values is None:
-            return []
+    predicted_class = int(np.argmax(probabilities))
+    confidence = float(probabilities[predicted_class])
 
-        if len(values) == 0:
-            return []
+    raw_signal = DIRECTION_LABELS[predicted_class]
+    signal = raw_signal if confidence >= MIN_SIGNAL_CONFIDENCE else "HOLD"
 
-        if alpha is None:
-            alpha = cls.SMOOTHING_ALPHA
+    if isinstance(predicted_return, torch.Tensor):
+        scaled_return = predicted_return.detach().cpu().numpy().reshape(-1)[0]
+    else:
+        scaled_return = np.asarray(predicted_return).reshape(-1)[0]
 
-        alpha = float(alpha)
+    real_return = (scaled_return * target_scaler.scale_[0]) + target_scaler.mean_[0]
 
-        if not 0.0 < alpha <= 1.0:
-            raise ValueError(
-                "Smoothing alpha must be between "
-                "0 and 1."
-            )
+    return {
+        "signal": signal,
+        "confidence": round(confidence, 4),
+        "probabilities": {
+            "SELL": round(float(probabilities[0]), 4),
+            "HOLD": round(float(probabilities[1]), 4),
+            "BUY": round(float(probabilities[2]), 4),
+        },
+        "predicted_return": round(float(real_return), 6),
+    }
 
-        cleaned = []
 
-        for value in values:
+# =========================================================
+# METRICS
+# =========================================================
 
-            value = float(value)
+train_losses = []
+val_losses = []
+mae_list = []
+rmse_list = []
+r2_list = []
+corr_list = []
+confidence_score_list = []
+multi_step_mae_list = []
 
-            if not np.isfinite(value):
-                if cleaned:
-                    value = cleaned[-1]
-                else:
-                    continue
+direction_accuracy_list = []
+buy_precision_list = []
+sell_precision_list = []
+hold_precision_list = []
+buy_recall_list = []
+sell_recall_list = []
+hold_recall_list = []
+confusion_matrix_list = []
 
-            cleaned.append(value)
 
-        if len(cleaned) <= 1:
-            return cleaned
+def calculate_confidence_score(residual_std, target_mean):
+    if target_mean == 0:
+        return 0.0
 
-        smoothed = [
-            cleaned[0]
-        ]
+    confidence = 100 - (residual_std / abs(target_mean)) * 100
+    confidence = max(0, min(100, confidence))
 
-        previous = cleaned[0]
+    return float(confidence)
 
-        for value in cleaned[1:]:
 
-            current = (
-                alpha * value
-                +
-                (1.0 - alpha) * previous
-            )
+def multi_step_validation(
+    model,
+    X_raw,
+    y_raw,
+    feature_scaler,
+    target_scaler,
+    steps=MULTI_STEP_VALIDATION_STEPS,
+    options_columns=None
+):
+    """
+    Rolls the model forward `steps` bars. Unlike the old price-target
+    version, the model's return head output here is a % RETURN, not a
+    price -- so each step has to:
+      1. Decode the scaled return prediction -> real return
+      2. Unscale the current window's last real close
+      3. predicted_price = real_close * (1 + real_return)
+      4. Rescale predicted_price back into feature space to write into
+         the rolled-forward window's open/close columns
 
-            smoothed.append(
-                float(current)
-            )
+    Only the return head is used for this recursive rollout; the
+    direction head has nothing to contribute here since there's no
+    "future direction" feature to roll forward.
 
-            previous = current
-
-        return smoothed
-
-    # ============================================================
-    # HISTORICAL PREDICTIONS
-    #
-    # For every historical candle:
-    #
-    # previous 60 candles
-    #        ↓
-    # GRU
-    #        ↓
-    # next-open return
-    #        ↓
-    # predicted price
-    #
-    # The prediction is attached to the NEXT candle timestamp.
-    # ============================================================
-
-    def historical_predictions(
-        self,
-        raw_df,
-        smooth=False,
-    ):
-
-        df = self._build_feature_frame(
-            raw_df
+    IMPORTANT: this recursive rollout only ever overwrites the
+    open/close slots of BASE_FEATURES. It has no way to produce future
+    expiry1_/expiry2_/expiry3_ options values -- doing so would mean
+    inventing fake future options-chain data. So whenever options
+    features are part of the input (options_columns is non-empty),
+    this function is skipped entirely and reports np.nan instead of
+    silently reusing stale, copied-forward options values across the
+    recursive horizon.
+    """
+    if options_columns:
+        print(
+            "Multi-step recursive validation skipped because future "
+            "options features are unavailable."
         )
+        return float(np.nan)
 
-        if len(df) <= self.sequence_length:
-            return [], []
+    model.eval()
 
-        times = []
-        predictions = []
+    predictions = []
+    targets = []
 
-        for i in range(
-            self.sequence_length,
-            len(df),
-        ):
+    sample_count = min(len(X_raw) - steps, 300)
 
-            # Exactly 60 real candles
-            window_df = (
-                df.iloc[
-                    i - self.sequence_length:i
-                ]
-            )
+    if sample_count <= 0:
+        return 0.0
 
-            result = (
-                self._predict_from_feature_window(
-                    window_df
-                )
-            )
+    return_mean = target_scaler.mean_[0]
+    return_scale = target_scaler.scale_[0]
 
-            pred_price = result[
-                "predicted_price"
-            ]
+    close_mean = feature_scaler.mean_[CLOSE_FEATURE_INDEX]
+    close_scale = feature_scaler.scale_[CLOSE_FEATURE_INDEX]
 
-            times.append(
-                df["datetime"].iloc[i]
-            )
+    open_mean = feature_scaler.mean_[OPEN_FEATURE_INDEX]
+    open_scale = feature_scaler.scale_[OPEN_FEATURE_INDEX]
 
-            predictions.append(
-                pred_price
-            )
+    with torch.no_grad():
+        for i in range(sample_count):
+            current_sequence = X_raw[i].copy()
 
-        # Optional standalone smoothing.
-        #
-        # get_prediction_line() deliberately calls
-        # historical_predictions(smooth=False) so the historical
-        # and future segments are smoothed together continuously.
-        if smooth:
+            step_predictions = []
 
-            predictions = (
-                self._smooth_prediction(
-                    predictions
-                )
-            )
-
-        return times, predictions
-
-    # ============================================================
-    # FUTURE FORECAST
-    #
-    # Recursive:
-    #
-    # 60 candles
-    #      ↓
-    # GRU
-    #      ↓
-    # predicted return
-    #      ↓
-    # predicted price
-    #      ↓
-    # synthetic candle
-    #      ↓
-    # repeat
-    #
-    # This generates the future prediction line.
-    # ============================================================
-
-    def predict(
-        self,
-        raw_df,
-        future_steps,
-        smooth=False,
-    ):
-
-        if future_steps <= 0:
-            return [], []
-
-        raw = raw_df.copy()
-
-        raw["datetime"] = pd.to_datetime(
-            raw["datetime"]
-        )
-
-        raw = (
-            raw
-            .sort_values("datetime")
-            .reset_index(drop=True)
-        )
-
-        interval = (
-            self._infer_bar_interval(raw)
-        )
-
-        # --------------------------------------------------------
-        # Indicator warmup
-        # --------------------------------------------------------
-
-        indicator_warmup = 50
-
-        history_needed = (
-            self.sequence_length
-            + indicator_warmup
-            + 10
-        )
-
-        raw_window = (
-            raw[
-                [
-                    "datetime",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                ]
-            ]
-            .iloc[-history_needed:]
-            .copy()
-            .reset_index(drop=True)
-        )
-
-        if len(raw_window) < self.sequence_length:
-            raise ValueError(
-                "Not enough historical data "
-                "for GRU forecast."
-            )
-
-        # --------------------------------------------------------
-        # REAL MARKET ANCHOR
-        # --------------------------------------------------------
-
-        last_real_close = float(
-            raw_window["close"].iloc[-1]
-        )
-
-        last_volume = float(
-            raw_window["volume"].iloc[-1]
-        )
-
-        # --------------------------------------------------------
-        # ATR PROXY
-        # Used only to prevent unstable recursive predictions.
-        # --------------------------------------------------------
-
-        recent_tr = (
-            raw_window["high"]
-            - raw_window["low"]
-        )
-
-        atr_proxy = float(
-            recent_tr
-            .rolling(14)
-            .mean()
-            .iloc[-1]
-        )
-
-        if (
-            not np.isfinite(atr_proxy)
-            or atr_proxy <= 0
-        ):
-
-            atr_proxy = max(
-                last_real_close * 0.001,
-                0.01,
-            )
-
-        last_time = (
-            raw_window["datetime"].iloc[-1]
-        )
-
-        future_times = []
-        future_predictions = []
-
-        previous_prediction = (
-            last_real_close
-        )
-
-        # ========================================================
-        # RECURSIVE FORECAST
-        # ========================================================
-
-        for step in range(
-            future_steps
-        ):
-
-            # ----------------------------------------------------
-            # Recalculate indicators on the current raw window.
-            #
-            # This is important because the GRU was trained using
-            # indicators. Every recursive step must rebuild them.
-            # ----------------------------------------------------
-
-            feature_window = add_indicators(
-                raw_window.copy(),
-                self.indicators,
-            )
-
-            feature_window = (
-                feature_window
-                .replace(
-                    [np.inf, -np.inf],
-                    np.nan,
-                )
-                .dropna()
-                .reset_index(drop=True)
-            )
-
-            if len(feature_window) < self.sequence_length:
-
-                raise RuntimeError(
-                    "Not enough valid feature rows "
-                    "for future prediction. "
-                    "Increase history_needed."
+            for step in range(steps):
+                seq_tensor = (
+                    torch.tensor(current_sequence, dtype=torch.float32)
+                    .unsqueeze(0)
+                    .to(DEVICE)
                 )
 
-            # ----------------------------------------------------
-            # GRU:
-            #
-            # 60 candles
-            #      ↓
-            # predicted return
-            #      ↓
-            # predicted price
-            # ----------------------------------------------------
+                predicted_return_tensor, _ = model(seq_tensor)
+                pred_return_scaled = predicted_return_tensor.cpu().numpy()[0][0]
 
-            result = (
-                self._predict_from_feature_window(
-                    feature_window
-                )
-            )
+                step_predictions.append(pred_return_scaled)
 
-            raw_predicted_price = result[
-                "predicted_price"
-            ]
+                # ---- decode: scaled return -> real return -> real price ----
+                real_return = (pred_return_scaled * return_scale) + return_mean
 
-            # ----------------------------------------------------
-            # RECURSIVE SANITY LIMIT
-            #
-            # This is NOT the prediction-line smoothing.
-            #
-            # It prevents a single bad recursive prediction from
-            # exploding the entire multi-step forecast.
-            # ----------------------------------------------------
+                last_close_scaled = current_sequence[-1][CLOSE_FEATURE_INDEX]
+                real_close = (last_close_scaled * close_scale) + close_mean
 
-            max_change = max(
-                atr_proxy * 2.0,
-                last_real_close * 0.002,
-            )
+                real_predicted_price = real_close * (1 + real_return)
 
-            lower_bound = (
-                previous_prediction
-                - max_change
-            )
+                # ---- re-encode predicted price for open/close columns ----
+                pred_open_scaled = (real_predicted_price - open_mean) / open_scale
+                pred_close_scaled = (real_predicted_price - close_mean) / close_scale
 
-            upper_bound = (
-                previous_prediction
-                + max_change
-            )
+                next_sequence = current_sequence.copy()
+                next_sequence[:-1] = next_sequence[1:]
 
-            pred_price = float(
-                np.clip(
-                    raw_predicted_price,
-                    lower_bound,
-                    upper_bound,
-                )
-            )
+                next_sequence[-1] = next_sequence[-2]
+                next_sequence[-1][OPEN_FEATURE_INDEX] = pred_open_scaled
+                next_sequence[-1][CLOSE_FEATURE_INDEX] = pred_close_scaled
 
-            # ----------------------------------------------------
-            # FUTURE TIMESTAMP
-            # ----------------------------------------------------
+                current_sequence = next_sequence
 
-            next_time = (
-                last_time + interval
-            )
+            predictions.extend(step_predictions)
+            targets.extend(y_raw[i:i + steps, 0])
 
-            last_time = next_time
+    predictions = np.array(predictions)
+    targets = np.array(targets)
 
-            future_times.append(
-                next_time
-            )
+    # Compare in RETURN space -- this metric measures return-prediction
+    # accuracy, matching what the return head actually optimizes.
+    predictions_real = (predictions * return_scale) + return_mean
+    targets_real = (targets * return_scale) + return_mean
 
-            future_predictions.append(
-                pred_price
-            )
+    multi_mae = mean_absolute_error(targets_real, predictions_real)
 
-            # ----------------------------------------------------
-            # SYNTHETIC FUTURE CANDLE
-            #
-            # We need a synthetic candle so that the next recursive
-            # GRU prediction has OHLCV data available.
-            # ----------------------------------------------------
+    return float(multi_mae)
 
-            synthetic_range = max(
-                atr_proxy * 0.50,
-                last_real_close * 0.0005,
-            )
 
-            synth_open = (
-                previous_prediction
-            )
+# =========================================================
+# TRAINING FUNCTION
+# =========================================================
 
-            synth_close = (
-                pred_price
-            )
+def train_model(
+    symbol=DEFAULT_SYMBOL,
+    indicators=None,
+    progress_callback=None,
+    stop_callback=None,
+    data_source="ftp",
+    data_path=""
+):
+    if indicators is None:
+        indicators = list(DEFAULT_INDICATORS)
 
-            synth_high = (
-                max(
-                    synth_open,
-                    synth_close,
-                )
-                + synthetic_range * 0.5
-            )
+    indicators = normalize_indicator_list(indicators)
 
-            synth_low = (
-                min(
-                    synth_open,
-                    synth_close,
-                )
-                - synthetic_range * 0.5
-            )
+    best_val_loss = np.inf
+    patience_counter = 0
 
-            new_row = pd.DataFrame(
-                [
-                    {
-                        "datetime": next_time,
-                        "open": synth_open,
-                        "high": synth_high,
-                        "low": synth_low,
-                        "close": synth_close,
-                        "volume": last_volume,
-                    }
-                ]
-            )
+    train_losses.clear()
+    val_losses.clear()
+    mae_list.clear()
+    rmse_list.clear()
+    r2_list.clear()
+    corr_list.clear()
+    confidence_score_list.clear()
+    multi_step_mae_list.clear()
 
-            raw_window = pd.concat(
-                [
-                    raw_window,
-                    new_row,
-                ],
-                ignore_index=True,
-            )
+    direction_accuracy_list.clear()
+    buy_precision_list.clear()
+    sell_precision_list.clear()
+    hold_precision_list.clear()
+    buy_recall_list.clear()
+    sell_recall_list.clear()
+    hold_recall_list.clear()
+    confusion_matrix_list.clear()
 
-            raw_window = (
-                raw_window
-                .iloc[-history_needed:]
-                .reset_index(drop=True)
-            )
+    symbol = symbol.upper()
 
-            previous_prediction = (
-                pred_price
-            )
+    MODEL_PATH = (
+        Path(__file__).parent.parent
+        / "models"
+        / f"best_gru_{symbol.lower()}.pth"
+    )
 
-        # --------------------------------------------------------
-        # Optional standalone future smoothing
-        #
-        # get_prediction_line() uses smooth=False here and then
-        # smooths historical + future together.
-        # --------------------------------------------------------
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-        if smooth:
+    (
+        train_loader,
+        test_loader,
+        feature_scaler,
+        target_scaler,
+        features,
+        indicator_columns,
+        options_columns
+    ) = prepare_training_data(symbol, indicators, data_source, data_path)
 
-            future_predictions = (
-                self._smooth_prediction(
-                    future_predictions
-                )
-            )
+    options_present = len(options_columns) > 0
 
-        return (
-            future_times,
-            future_predictions,
+    print_training_summary(
+        symbol,
+        indicators,
+        indicator_columns,
+        features,
+        data_source=data_source,
+        options_columns=options_columns
+    )
+
+    return_loss_fn = nn.HuberLoss()
+    direction_loss_fn = nn.CrossEntropyLoss()
+
+    model = GRURegressor(n_features=len(features)).to(DEVICE)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY
+    )
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=10
+    )
+
+    for epoch in range(EPOCHS):
+        print(f"\nEpoch [{epoch + 1}/{EPOCHS}] Started...")
+
+        model.train()
+        running_train_loss = 0
+
+        for X_batch, y_batch in train_loader:
+            if stop_callback and stop_callback():
+                print("\nTraining Stopped By User")
+                return False
+
+            X_batch = X_batch.to(DEVICE)
+            y_batch = y_batch.to(DEVICE)
+
+            y_return = y_batch[:, 0:1]
+            y_direction = y_batch[:, 1].long()
+
+            optimizer.zero_grad()
+
+            predicted_return, direction_logits = model(X_batch)
+
+            return_loss_value = return_loss_fn(predicted_return, y_return)
+            direction_loss_value = direction_loss_fn(direction_logits, y_direction)
+            loss = return_loss_value + direction_loss_value
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            running_train_loss += loss.item()
+
+        avg_train_loss = running_train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+
+        model.eval()
+
+        running_val_loss = 0
+        all_return_predictions = []
+        all_return_targets = []
+        all_direction_logits = []
+        all_direction_targets = []
+        X_validation_raw = []
+        y_validation_raw = []
+
+        with torch.no_grad():
+            for X_batch, y_batch in test_loader:
+                X_batch = X_batch.to(DEVICE)
+                y_batch = y_batch.to(DEVICE)
+
+                y_return = y_batch[:, 0:1]
+                y_direction = y_batch[:, 1].long()
+
+                predicted_return, direction_logits = model(X_batch)
+
+                return_loss_value = return_loss_fn(predicted_return, y_return)
+                direction_loss_value = direction_loss_fn(direction_logits, y_direction)
+                loss = return_loss_value + direction_loss_value
+
+                running_val_loss += loss.item()
+
+                all_return_predictions.extend(predicted_return.cpu().numpy())
+                all_return_targets.extend(y_return.cpu().numpy())
+                all_direction_logits.extend(direction_logits.cpu().numpy())
+                all_direction_targets.extend(y_direction.cpu().numpy())
+
+                X_validation_raw.extend(X_batch.cpu().numpy())
+                y_validation_raw.extend(y_batch.cpu().numpy())
+
+        avg_val_loss = running_val_loss / len(test_loader)
+        val_losses.append(avg_val_loss)
+
+        scheduler.step(avg_val_loss)
+
+        all_return_predictions = np.array(all_return_predictions)
+        all_return_targets = np.array(all_return_targets)
+
+        # ---- Unscale: RETURN space, not price ----
+        return_pred_real = target_scaler.inverse_transform(all_return_predictions)[:, 0]
+        return_true_real = target_scaler.inverse_transform(all_return_targets)[:, 0]
+
+        prediction_std = np.std(return_pred_real)
+        target_std = np.std(return_true_real)
+
+        mae = mean_absolute_error(return_true_real, return_pred_real)
+        rmse = np.sqrt(mean_squared_error(return_true_real, return_pred_real))
+        r2 = r2_score(return_true_real, return_pred_real)
+        corr = float(np.corrcoef(return_true_real, return_pred_real)[0, 1])
+
+        residual_std = np.std(return_true_real - return_pred_real)
+
+        confidence_score = calculate_confidence_score(
+            residual_std, np.mean(return_true_real)
         )
 
-    # ============================================================
-    # FULL PREDICTION LINE
-    #
-    # FINAL PIPELINE:
-    #
-    # Historical:
-    #
-    # 60 candles
-    #      ↓
-    # GRU
-    #      ↓
-    # next-open % return
-    #      ↓
-    # predicted price
-    #
-    # Future:
-    #
-    # 60 candles
-    #      ↓
-    # GRU
-    #      ↓
-    # next-open % return
-    #      ↓
-    # predicted price
-    #      ↓
-    # recursive forecast
-    #
-    # Then:
-    #
-    # historical prices + future prices
-    #      ↓
-    # ONE light EMA smoothing pass
-    #      ↓
-    # prediction line
-    # ============================================================
+        # ---- Direction classification metrics ----
+        all_direction_logits = np.array(all_direction_logits)
+        all_direction_targets = np.array(all_direction_targets)
+        direction_pred_classes = np.argmax(all_direction_logits, axis=1)
 
-    def get_prediction_line(
-        self,
-        raw_df,
-        future_steps,
-        smooth=True,
-    ):
+        direction_accuracy = accuracy_score(all_direction_targets, direction_pred_classes)
 
-        # --------------------------------------------------------
-        # HISTORICAL
-        #
-        # IMPORTANT:
-        # smooth=False here.
-        # --------------------------------------------------------
+        precision = precision_score(
+            all_direction_targets, direction_pred_classes,
+            labels=[0, 1, 2], average=None, zero_division=0
+        )
+        recall = recall_score(
+            all_direction_targets, direction_pred_classes,
+            labels=[0, 1, 2], average=None, zero_division=0
+        )
+        cm = confusion_matrix(
+            all_direction_targets, direction_pred_classes, labels=[0, 1, 2]
+        )
 
-        historical_times, historical_predictions = (
-            self.historical_predictions(
-                raw_df,
-                smooth=False,
+        sell_precision, hold_precision, buy_precision = precision[0], precision[1], precision[2]
+        sell_recall, hold_recall, buy_recall = recall[0], recall[1], recall[2]
+
+        # ---- One-step validation is always run, unchanged, above.
+        # Multi-step (recursive) validation is skipped internally by
+        # multi_step_validation() whenever options_columns is
+        # non-empty, and returns np.nan in that case instead of
+        # recursively fabricating future options features. ----
+        multi_step_mae = multi_step_validation(
+            model,
+            np.array(X_validation_raw),
+            np.array(y_validation_raw),
+            feature_scaler,
+            target_scaler,
+            steps=MULTI_STEP_VALIDATION_STEPS,
+            options_columns=options_columns
+        )
+
+        mae_list.append(mae)
+        rmse_list.append(rmse)
+        r2_list.append(r2)
+        corr_list.append(corr)
+        confidence_score_list.append(confidence_score)
+        multi_step_mae_list.append(multi_step_mae)
+
+        direction_accuracy_list.append(direction_accuracy)
+        buy_precision_list.append(buy_precision)
+        sell_precision_list.append(sell_precision)
+        hold_precision_list.append(hold_precision)
+        buy_recall_list.append(buy_recall)
+        sell_recall_list.append(sell_recall)
+        hold_recall_list.append(hold_recall)
+        confusion_matrix_list.append(cm)
+
+        print("\n========== RETURN DIAGNOSTICS (target_next_return) ==========")
+        print("Prediction STD:", prediction_std)
+        print("Target STD    :", target_std)
+        print("Prediction Mean:", np.mean(return_pred_real))
+        print("Target Mean    :", np.mean(return_true_real))
+        print("Prediction Min :", np.min(return_pred_real))
+        print("Prediction Max :", np.max(return_pred_real))
+        print("Target Min     :", np.min(return_true_real))
+        print("Target Max     :", np.max(return_true_real))
+        print("======================================")
+
+        print("\n========== DIRECTION DIAGNOSTICS (target_direction) ==========")
+        print(f"Direction Accuracy  : {direction_accuracy:.4f}")
+        print(f"BUY Precision       : {buy_precision:.4f}")
+        print(f"SELL Precision      : {sell_precision:.4f}")
+        print(f"HOLD Precision      : {hold_precision:.4f}")
+        print(f"BUY Recall          : {buy_recall:.4f}")
+        print(f"SELL Recall         : {sell_recall:.4f}")
+        print(f"HOLD Recall         : {hold_recall:.4f}")
+        print("Confusion Matrix (rows=true, cols=pred) [SELL, HOLD, BUY]:")
+        print(cm)
+        print("======================================")
+
+        # ---- Safe formatting: multi_step_mae is np.nan whenever
+        # options features are enabled, so it can't go through a
+        # plain ":.6f}" format spec without raising. ----
+        if np.isnan(multi_step_mae):
+            multi_step_mae_display = "N/A (options features enabled)"
+        else:
+            multi_step_mae_display = f"{multi_step_mae:.6f}"
+
+        print(f"Epoch [{epoch + 1}] Completed")
+        print(f"Train Loss          : {avg_train_loss:.6f}")
+        print(f"Val Loss            : {avg_val_loss:.6f}")
+        print(f"MAE                 : {mae:.6f}")
+        print(f"RMSE                : {rmse:.6f}")
+        print(f"R\u00b2                  : {r2:.6f}")
+        print(f"Correlation         : {corr:.6f}")
+        print(f"Confidence Score    : {confidence_score:.2f}%")
+        print(f"Multi-Step MAE      : {multi_step_mae_display}")
+        print(f"Direction Accuracy  : {direction_accuracy:.4f}")
+        print(f"BUY Precision       : {buy_precision:.4f}")
+        print(f"SELL Precision      : {sell_precision:.4f}")
+        print(f"HOLD Precision      : {hold_precision:.4f}")
+
+        if progress_callback:
+            progress_callback(epoch + 1, EPOCHS, avg_train_loss, avg_val_loss)
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "model_type": "GRU",
+                    "features": features,
+                    "indicators": indicators,
+                    "indicator_columns": indicator_columns,
+                    "sequence_length": SEQUENCE_LENGTH,
+                    "forecast_steps": FORECAST_STEPS,
+
+                    "target_columns": TARGET_COLUMNS,
+                    "return_target_column": RETURN_TARGET_COLUMN,
+                    "direction_target_column": DIRECTION_TARGET_COLUMN,
+                    "direction_threshold": DIRECTION_THRESHOLD,
+                    "direction_labels": DIRECTION_LABELS,
+                    "min_signal_confidence": MIN_SIGNAL_CONFIDENCE,
+                    "target_type": TARGET_TYPE,
+
+                    "target_scaler_mean": target_scaler.mean_,
+                    "target_scaler_scale": target_scaler.scale_,
+
+                    "feature_scaler_mean": feature_scaler.mean_,
+                    "feature_scaler_scale": feature_scaler.scale_,
+
+                    "close_feature_index": CLOSE_FEATURE_INDEX,
+                    "open_feature_index": OPEN_FEATURE_INDEX,
+
+                    "residual_std": residual_std,
+                    "confidence_score": confidence_score,
+                    "multi_step_validation_mae": multi_step_mae,
+
+                    "direction_accuracy": direction_accuracy,
+                    "buy_precision": buy_precision,
+                    "sell_precision": sell_precision,
+                    "hold_precision": hold_precision,
+                    "buy_recall": buy_recall,
+                    "sell_recall": sell_recall,
+                    "hold_recall": hold_recall,
+                    "confusion_matrix": cm.tolist(),
+
+                    "dropout_rate": DROPOUT_RATE,
+                    "gru_hidden_size": GRU_HIDDEN_SIZE,
+                    "gru_num_layers": GRU_NUM_LAYERS,
+                    "multi_step_validation_steps": MULTI_STEP_VALIDATION_STEPS,
+
+                    # ---- Options-feature metadata ----
+                    "options_features_enabled": options_present,
+                    "options_columns": options_columns,
+                },
+                MODEL_PATH
             )
-        )
 
-        # --------------------------------------------------------
-        # FUTURE
-        #
-        # IMPORTANT:
-        # smooth=False here.
-        # --------------------------------------------------------
+            print("\nBest GRU Model Saved")
 
-        future_times, future_predictions = (
-            self.predict(
-                raw_df,
-                future_steps,
-                smooth=False,
-            )
-        )
+        else:
+            patience_counter += 1
 
-        # --------------------------------------------------------
-        # COMBINE BEFORE SMOOTHING
-        #
-        # This avoids a visible smoothing reset at the boundary.
-        # --------------------------------------------------------
+        if patience_counter >= PATIENCE:
+            print("\nEarly Stopping Triggered")
+            return True
 
-        all_times = (
-            list(historical_times)
-            +
-            list(future_times)
-        )
+    print("\nGRU Training Complete.")
+    return True
 
-        all_predictions = (
-            list(historical_predictions)
-            +
-            list(future_predictions)
-        )
 
-        # --------------------------------------------------------
-        # ONE LIGHT SMOOTHING PASS
-        # --------------------------------------------------------
-
-        if smooth:
-
-            all_predictions = (
-                self._smooth_prediction(
-                    all_predictions,
-                    alpha=self.SMOOTHING_ALPHA,
-                )
-            )
-
-        # --------------------------------------------------------
-        # HISTORICAL/FUTURE BOUNDARY
-        # --------------------------------------------------------
-
-        boundary_index = (
-            len(historical_times)
-        )
-
-        return (
-            all_times,
-            all_predictions,
-            boundary_index,
-        )
+if __name__ == "__main__":
+    train_model(
+        symbol=DEFAULT_SYMBOL,
+        indicators=DEFAULT_INDICATORS,
+        data_source="local",
+        data_path="data/OptionsDataAllDteSPY.jsonlines"
+    )
