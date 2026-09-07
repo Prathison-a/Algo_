@@ -1,32 +1,30 @@
-Make ONLY the following compatibility change in my frontend/app.js.
+In GRUPredictor.py, make ONLY this change.
 
-1. Find this exact line:
+Find:
 
-ts.candleMarkers = LightweightCharts.createSeriesMarkers(ts.candles);
-
-Replace it with:
-
-ts.candleMarkers = null;
-
-
-2. Find this exact block in runForecast():
-
-if (data.signals && data.signals.length > 0) {
-    ts.candleMarkers.setMarkers(toChartMarkers(data.signals));
-} else {
-    ts.candleMarkers.setMarkers([]);
-}
+option_feature_columns = [
+    c for c in self.features
+    if c not in (
+        "open", "high", "low", "close", "volume"
+    )
+    and c in raw.columns
+]
 
 Replace it with:
 
-if (ts.candleMarkers) {
-    if (data.signals && data.signals.length > 0) {
-        ts.candleMarkers.setMarkers(toChartMarkers(data.signals));
-    } else {
-        ts.candleMarkers.setMarkers([]);
-    }
-}
+option_feature_columns = resolve_options_columns(raw)
 
-Do NOT change anything else in app.js, app.py, TCN, GRU, predictor, forecast logic, SignalEngine, API payloads, chart configuration, or indicators.
+missing_option_features = [
+    c for c in self.features
+    if c.startswith(("expiry1_", "expiry2_", "expiry3_"))
+    and c not in raw.columns
+]
 
-The purpose of this change is only to prevent LightweightCharts.createSeriesMarkers() from stopping JavaScript initialization if the loaded Lightweight Charts version does not support that API.
+if missing_option_features:
+    raise RuntimeError(
+        "Missing required options features for GRU prediction: "
+        f"{missing_option_features}"
+    )
+
+Do NOT change anything else in GRUPredictor.py.
+Do NOT rewrite or refactor the file.
