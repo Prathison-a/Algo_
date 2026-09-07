@@ -1,85 +1,32 @@
-Make ONLY the following changes to my existing signal_engine.py.
-1. REMOVE the old BUY/SELL decision logic based on:
-   - EMA9 vs EMA20
-   - predicted_move_pct
-   - current_price
-   - predicted_next_open
-   - prediction slope
-   - threshold_pct
-2. USE the TCN classifier output directly.
-The Signal Engine must read:
-prediction["signal"]
-prediction["confidence"]
-prediction["probabilities"]
-prediction["probability_margin"]
-prediction["predicted_return"]
-prediction["predicted_price"]
-3. Add these two filters:
-MIN_CONFIDENCE = 0.70
-MIN_PROBABILITY_MARGIN = 0.10
-Rules:
-if model signal == "HOLD":
-    final signal = "HOLD"
-if confidence < 0.70:
-    final signal = "HOLD"
-if probability_margin < 0.10:
-    final signal = "HOLD"
-Otherwise:
-    final signal = model signal
-4. KEEP EDGE-TRIGGERED SIGNALS.
-The final output must behave exactly like:
-TCN output:     BUY BUY BUY HOLD HOLD SELL SELL BUY
-Final output:   BUY HOLD HOLD HOLD HOLD SELL HOLD BUY
-Rules:
-- First BUY = BUY
-- Repeated BUY = HOLD
-- First SELL after BUY = SELL
-- Repeated SELL = HOLD
-- First BUY after SELL = BUY
-- HOLD must NOT reset the previous actionable state
-5. KEEP reset() for clearing the edge-trigger state.
-6. KEEP the existing result fields and return:
-{
-    "signal": final_signal,
-    "model_signal": model_signal,
-    "confidence": confidence,
-    "probabilities": probabilities,
-    "probability_margin": probability_margin,
-    "predicted_return": predicted_return,
-    "predicted_price": predicted_price
+Make ONLY the following compatibility change in my frontend/app.js.
+
+1. Find this exact line:
+
+ts.candleMarkers = LightweightCharts.createSeriesMarkers(ts.candles);
+
+Replace it with:
+
+ts.candleMarkers = null;
+
+
+2. Find this exact block in runForecast():
+
+if (data.signals && data.signals.length > 0) {
+    ts.candleMarkers.setMarkers(toChartMarkers(data.signals));
+} else {
+    ts.candleMarkers.setMarkers([]);
 }
-7. KEEP Lightweight Charts marker generation.
-Only:
-    signal == "BUY"
-    signal == "SELL"
-should create chart markers.
-HOLD must not create a marker.
-8. Do NOT change:
-- TCN training code
-- TCN architecture
-- TCN predictor
-- features
-- options data
-- indicators used for model training
-- sequence length
-- target calculation
-- model thresholds
-- SL/TP
-- risk/reward
-- backtesting
-- frontend
-- unrelated code
-9. Do NOT rewrite the entire file.
-Modify only the existing signal decision/filtering and edge-triggering parts required above.
-10. Add a small test confirming:
-BUY   → BUY
-BUY   → HOLD
-BUY   → HOLD
-HOLD  → HOLD
-SELL  → SELL
-SELL  → HOLD
-BUY   → BUY
-After making the changes, show me ONLY:
-A. What sections/functions were changed
-B. The exact changed code
-C. Confirmation that no other files were modified.
+
+Replace it with:
+
+if (ts.candleMarkers) {
+    if (data.signals && data.signals.length > 0) {
+        ts.candleMarkers.setMarkers(toChartMarkers(data.signals));
+    } else {
+        ts.candleMarkers.setMarkers([]);
+    }
+}
+
+Do NOT change anything else in app.js, app.py, TCN, GRU, predictor, forecast logic, SignalEngine, API payloads, chart configuration, or indicators.
+
+The purpose of this change is only to prevent LightweightCharts.createSeriesMarkers() from stopping JavaScript initialization if the loaded Lightweight Charts version does not support that API.
