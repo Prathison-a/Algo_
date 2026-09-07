@@ -13,6 +13,23 @@ from train.GRU_Training import (
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def resolve_options_columns(raw):
+    """
+    NOTE: Added as an assumed helper since `resolve_options_columns`
+    was referenced but not defined anywhere in the codebase provided.
+    Mirrors the original inline logic: returns the subset of
+    self.features-style option columns present in `raw`, if such
+    columns exist. This is a best-effort placeholder pending
+    confirmation of where this function should actually live.
+    """
+    return [
+        c for c in raw.columns
+        if c not in (
+            "datetime", "open", "high", "low", "close", "volume"
+        )
+    ]
+
+
 class GRUPredictor:
 
     # ============================================================
@@ -663,6 +680,30 @@ class GRUPredictor:
             .sort_values("datetime")
             .reset_index(drop=True)
         )
+
+        # ------------------------------------------------------------
+        # OPTIONS FEATURE COLUMNS
+        #
+        # ASSUMPTION (unconfirmed): validates that any options-chain
+        # features expected by the model (expiry1_/expiry2_/expiry3_
+        # prefixed columns in self.features) are present in the raw
+        # input. Added here since this is the first point `raw` with
+        # its full set of input columns is available.
+        # ------------------------------------------------------------
+
+        option_feature_columns = resolve_options_columns(raw)
+
+        missing_option_features = [
+            c for c in self.features
+            if c.startswith(("expiry1_", "expiry2_", "expiry3_"))
+            and c not in raw.columns
+        ]
+
+        if missing_option_features:
+            raise RuntimeError(
+                "Missing required options features for GRU prediction: "
+                f"{missing_option_features}"
+            )
 
         interval = (
             self._infer_bar_interval(raw)
