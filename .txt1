@@ -1,6 +1,14 @@
-Get some help with AI and provide the option data to analyze.
+Review my current GRU training code and make ONLY the following changes. Do not rewrite, redesign, or modify anything else.
 
-Copy one row from the file, give it to AI and tell it that we have three expiries of data in each lines .  Can you help analyze OPtion chain and Ohlcv data combined? Also state that the file resides here.
+1. Change the dataset split from the current 80/20 split to a chronological 70% TRAIN / 15% VALIDATION / 15% TEST split.
+2. Use the VALIDATION set for EarlyStopping and ReduceLROnPlateau. The TEST set must be used only for final evaluation.
+3. Keep the existing GRU architecture, dual-head outputs, targets, feature engineering, options integration, scalers, sequence length, losses, optimizer, and checkpoint structure unchanged.
+4. Keep `SEQUENCE_LENGTH = 60`.
+5. Keep `DIRECTION_THRESHOLD = 0.0015` unchanged.
+6. Do NOT change the existing multi-step validation behavior for options data.
+7. Do NOT use the custom statistical confidence score for BUY/SELL/HOLD decisions. Keep the model's direction softmax confidence as the trading confidence.
+8. Add a simple class-distribution check for SELL/HOLD/BUY. Do not add class weighting unless the existing class distribution clearly requires it.
+9. Do not change the FTP/data-loading logic except fix the hardcoded FTP credentials if necessary by reading them from environment variables.
+10. Fix the local Windows data path so it uses a safe raw string or forward slashes.
 
-Also Tell it that the file resides here.
-Copy it locally and use it . else connecting to ftp every minute would be slow  
+Most importantly: preserve the current model architecture and behavior. I only want these targeted fixes, not a complete rewrite.
