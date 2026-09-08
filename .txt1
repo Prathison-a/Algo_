@@ -1,14 +1,85 @@
-Review my current GRU training code and make ONLY the following changes. Do not rewrite, redesign, or modify anything else.
+Modify my existing GRU training Python file.
 
-1. Change the dataset split from the current 80/20 split to a chronological 70% TRAIN / 15% VALIDATION / 15% TEST split.
-2. Use the VALIDATION set for EarlyStopping and ReduceLROnPlateau. The TEST set must be used only for final evaluation.
-3. Keep the existing GRU architecture, dual-head outputs, targets, feature engineering, options integration, scalers, sequence length, losses, optimizer, and checkpoint structure unchanged.
-4. Keep `SEQUENCE_LENGTH = 60`.
-5. Keep `DIRECTION_THRESHOLD = 0.0015` unchanged.
-6. Do NOT change the existing multi-step validation behavior for options data.
-7. Do NOT use the custom statistical confidence score for BUY/SELL/HOLD decisions. Keep the model's direction softmax confidence as the trading confidence.
-8. Add a simple class-distribution check for SELL/HOLD/BUY. Do not add class weighting unless the existing class distribution clearly requires it.
-9. Do not change the FTP/data-loading logic except fix the hardcoded FTP credentials if necessary by reading them from environment variables.
-10. Fix the local Windows data path so it uses a safe raw string or forward slashes.
+IMPORTANT: Do NOT rewrite, refactor, optimize, or change anything unrelated to this request.
 
-Most importantly: preserve the current model architecture and behavior. I only want these targeted fixes, not a complete rewrite.
+Make ONLY these changes:
+
+1. Change the current dataset split from:
+
+   * 80% training
+   * 20% test/validation
+
+   to a chronological:
+
+   * 70% training
+   * 15% validation
+   * 15% test
+
+2. Keep the data in chronological order. Do NOT randomly split the time-series data.
+
+3. Create separate:
+
+   * train_dataset
+   * val_dataset
+   * test_dataset
+
+4. Create separate:
+
+   * train_loader
+   * val_loader
+   * test_loader
+
+5. Keep:
+
+   * shuffle=True for train_loader
+   * shuffle=False for val_loader
+   * shuffle=False for test_loader
+
+6. During each training epoch:
+
+   * use train_loader for weight updates
+   * use val_loader for validation loss
+   * use validation loss for ReduceLROnPlateau
+   * use validation loss for early stopping
+   * use validation loss for selecting/saving the best model
+
+7. Do NOT use test_loader anywhere during the training/validation loop.
+
+8. After training is completely finished and the best validation checkpoint is selected, evaluate the final model using test_loader ONLY for final test metrics.
+
+9. Keep the existing feature-scaler behavior:
+
+   * fit scalers only using training data
+   * transform validation and test using the training-fitted scalers
+   * do NOT fit a separate scaler on validation or test data.
+
+10. Do NOT change anything else:
+
+* keep the GRU architecture exactly the same
+* keep 116 total features
+* keep the 102 options features
+* keep all existing indicators
+* keep sequence length = 60
+* keep the existing return target
+* keep BUY/HOLD/SELL direction target
+* keep Huber loss
+* keep CrossEntropy loss
+* keep optimizer
+* keep scheduler
+* keep gradient clipping
+* keep checkpoint structure
+* keep options loading
+* keep the existing main() / train_model() interface
+* keep existing logging/diagnostic output unless a small change is necessary to correctly show train/validation/test sizes.
+
+11. Preserve all existing functionality.
+
+After making ONLY these changes, return the COMPLETE UPDATED PYTHON CODE, not a diff and not an explanation.
+
+Before returning the code, verify that:
+
+* train_loader is used for training
+* val_loader is used for validation/early stopping/scheduler
+* test_loader is used only after training
+* the split is exactly 70/15/15 and chronological
+* no scaler is fitted using validation or test data.
