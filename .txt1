@@ -1,18 +1,4 @@
-Update ONLY `engine/tcn_predictor.py`.
-
-Do not rewrite the whole file. Do not change `TCN_Training.py`, `app.py`, UI files, or any other file.
-
-The current `TCN_Training.py` uses a 3-head `TCNDualHead`:
-
-1. `open_head` → `target_next_open`
-2. `return_head` → `target_next_return`
-3. `direction_head` → `target_direction`
-
-Make `engine/tcn_predictor.py` exactly compatible with this architecture.
-
-### 1. Add `open_head`
-
-Inside `TCNDualHead.__init__()`, change:import torch
+import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
@@ -285,6 +271,7 @@ class TCNDualHead(nn.Module):
         self.fc1 = nn.Linear(64 * self.recent_timesteps, 128)
         self.fc2 = nn.Linear(128, 64)
 
+        self.open_head = nn.Linear(64, 1)
         self.return_head = nn.Linear(64, 1)
         self.direction_head = nn.Linear(64, 3)
 
@@ -307,10 +294,11 @@ class TCNDualHead(nn.Module):
         x = self.gelu(x)
         x = self.dropout(x)
 
+        open_prediction = self.open_head(x)
         return_prediction = self.return_head(x)
         direction_logits = self.direction_head(x)
 
-        return return_prediction, direction_logits
+        return open_prediction, return_prediction, direction_logits
 
 
 class TCNPredictor:
@@ -404,6 +392,10 @@ class TCNPredictor:
         self.target_scaler.mean_ = checkpoint["target_scaler_mean"]
         self.target_scaler.scale_ = checkpoint["target_scaler_scale"]
 
+        self.open_target_scaler = StandardScaler()
+        self.open_target_scaler.mean_ = checkpoint["open_scaler_mean"]
+        self.open_target_scaler.scale_ = checkpoint["open_scaler_scale"]
+
     # =====================================================
     # FEATURE VALIDATION
     # =====================================================
@@ -488,6 +480,18 @@ class TCNPredictor:
 
         return signal, confidence, probabilities, probability_margin
 
+    def _decode_open(self, raw_open):
+        raw_open = np.atleast_1d(
+            np.asarray(raw_open, dtype=np.float64)
+        ).reshape(-1)
+
+        scaled_open = raw_open[0]
+
+        mean = self.open_target_scaler.mean_[0]
+        scale = self.open_target_scaler.scale_[0]
+
+        return float((scaled_open * scale) + mean)
+
     def _ensure_finite(self, value, name):
         if not np.isfinite(value):
             raise ValueError(
@@ -556,20 +560,18 @@ class TCNPredictor:
                     .to(DEVICE)
                 )
 
-                predicted_return_tensor, _direction_logits = self.model(seq_tensor)
-
-                predicted_return = self._decode_return(
-                    predicted_return_tensor.cpu().numpy()[0]
+                open_prediction_tensor, predicted_return_tensor, _direction_logits = self.model(
+                    seq_tensor
                 )
 
-                # The window's last real bar sits at index i - 1; that
-                # bar's close is what target_next_return was measured
-                # from during training (see add_targets() in
-                # TCN_Training.py).
-                current_close = float(raw_close[i - 1])
+                predicted_price = self._decode_open(
+                    open_prediction_tensor.cpu().numpy()[0]
+                )
 
-                predicted_price = current_close * (1.0 + predicted_return)
-                predicted_price = self._ensure_finite(predicted_price, "predicted_price")
+                predicted_price = self._ensure_finite(
+                    predicted_price,
+                    "predicted_price"
+                )
 
                 historical_predictions.append(predicted_price)
                 historical_times.append(df["datetime"].iloc[i])
@@ -823,7 +825,9 @@ class TCNPredictor:
                     .to(DEVICE)
                 )
 
-                predicted_return_tensor, direction_logits = self.model(seq_tensor)
+                open_prediction_tensor, predicted_return_tensor, direction_logits = self.model(
+                    seq_tensor
+                )
 
                 predicted_return = self._decode_return(
                     predicted_return_tensor.cpu().numpy()[0]
@@ -833,7 +837,9 @@ class TCNPredictor:
                     direction_logits
                 )
 
-                predicted_price = current_close * (1.0 + predicted_return)
+                predicted_price = self._decode_open(
+                    open_prediction_tensor.cpu().numpy()[0]
+                )
 
                 if max_step_move > 0:
                     delta = predicted_price - current_close
@@ -909,226 +915,3 @@ class TCNPredictor:
         }
 
         return self._sanitize_for_json(result)
-
-```python
-self.return_head = nn.Linear(64, 1)
-self.direction_head = nn.Linear(64, 3)
-```
-
-to:
-
-```python
-self.open_head = nn.Linear(64, 1)
-self.return_head = nn.Linear(64, 1)
-self.direction_head = nn.Linear(64, 3)
-```
-
-### 2. Update `TCNDualHead.forward()`
-
-Change:
-
-```python
-return_prediction = self.return_head(x)
-direction_logits = self.direction_head(x)
-
-return return_prediction, direction_logits
-```
-
-to:
-
-```python
-open_prediction = self.open_head(x)
-return_prediction = self.return_head(x)
-direction_logits = self.direction_head(x)
-
-return open_prediction, return_prediction, direction_logits
-```
-
-### 3. Load the direct open-target scaler
-
-The TCN checkpoint saves:
-
-```python
-open_scaler_mean
-open_scaler_scale
-```
-
-After the existing `target_scaler` setup, add:
-
-```python
-self.open_target_scaler = StandardScaler()
-self.open_target_scaler.mean_ = checkpoint["open_scaler_mean"]
-self.open_target_scaler.scale_ = checkpoint["open_scaler_scale"]
-```
-
-Keep the existing return `target_scaler` because `target_next_return` is still required.
-
-### 4. Add `_decode_open()`
-
-Add this method before `historical_predictions()`:
-
-```python
-def _decode_open(self, raw_open):
-    raw_open = np.atleast_1d(
-        np.asarray(raw_open, dtype=np.float64)
-    ).reshape(-1)
-
-    scaled_open = raw_open[0]
-
-    mean = self.open_target_scaler.mean_[0]
-    scale = self.open_target_scaler.scale_[0]
-
-    return float((scaled_open * scale) + mean)
-```
-
-### 5. Fix historical predictions
-
-In `historical_predictions()`, currently the model output is treated as return prediction.
-
-Replace the model call and price calculation:
-
-```python
-predicted_return_tensor, _direction_logits = self.model(seq_tensor)
-
-predicted_return = self._decode_return(
-    predicted_return_tensor.cpu().numpy()[0]
-)
-
-current_close = float(raw_close[i - 1])
-
-predicted_price = current_close * (1.0 + predicted_return)
-```
-
-with:
-
-```python
-open_prediction_tensor, predicted_return_tensor, _direction_logits = self.model(
-    seq_tensor
-)
-
-predicted_price = self._decode_open(
-    open_prediction_tensor.cpu().numpy()[0]
-)
-
-predicted_price = self._ensure_finite(
-    predicted_price,
-    "predicted_price"
-)
-```
-
-Keep the existing historical timestamp logic:
-
-```python
-historical_times.append(df["datetime"].iloc[i])
-```
-
-The historical prediction must represent:
-
-```text
-previous 60 real candles
-        ↓
-      TCN
-        ↓
-   open_head
-        ↓
-next candle OPEN
-        ↓
-prediction attached to next candle timestamp
-```
-
-Do NOT calculate the historical predicted price from:
-
-```python
-current_close * (1 + predicted_return)
-```
-
-The historical cyan line must use the direct `open_head`.
-
-### 6. Fix `predict()`
-
-Find:
-
-```python
-predicted_return_tensor, direction_logits = self.model(seq_tensor)
-```
-
-Change it to:
-
-```python
-open_prediction_tensor, predicted_return_tensor, direction_logits = self.model(
-    seq_tensor
-)
-```
-
-Then replace the current predicted-price calculation:
-
-```python
-predicted_price = current_close * (1.0 + predicted_return)
-```
-
-with:
-
-```python
-predicted_price = self._decode_open(
-    open_prediction_tensor.cpu().numpy()[0]
-)
-```
-
-Keep the existing direction decoding and return decoding.
-
-Keep the existing ATR safety logic if present, but make sure the final `predicted_price` comes from the direct `open_head`.
-
-### 7. Preserve everything else
-
-Do NOT remove:
-
-* options feature validation
-* historical prediction logic
-* recursive forecasting
-* indicator state handling
-* ATR protection
-* direction probabilities
-* probability margin
-* signal confidence
-* JSON sanitization
-* existing feature/scaler loading
-
-Do NOT change the model architecture other than adding the missing `open_head`.
-
-Do NOT change the checkpoint filename yet.
-
-Do NOT add source-specific TCN filenames yet.
-
-### Expected result
-
-After these changes, the current TCN predictor must load a checkpoint containing:
-
-```text
-open_head.weight
-open_head.bias
-return_head.weight
-return_head.bias
-direction_head.weight
-direction_head.bias
-```
-
-and the prediction flow must be:
-
-```text
-TCN
- ├── open_head      → target_next_open
- ├── return_head    → target_next_return
- └── direction_head → SELL / HOLD / BUY
-```
-
-Most importantly:
-
-```text
-Historical:
-60 real candles → predict next candle OPEN → cyan historical line
-
-Future:
-current 60-candle window → predict next OPEN → recursive future prediction
-```
-
-After editing, show only the changed sections and confirm that the file is ready for testing.
