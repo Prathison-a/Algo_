@@ -911,6 +911,6 @@ class TCNPredictor:
             "future_times": future_times,
             "future_predictions": future_predictions,
             "probability_margin": first_probability_margin,
-        }
+        }}
 
         return self._sanitize_for_json(result)
