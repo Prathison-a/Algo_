@@ -24,9 +24,9 @@ Decision path
        BUY  requires ALL of:
            - predicted_move_pct >  threshold_pct   (TCN bullish)
            - ema9  > ema20 > ema50                 (EMA stack bullish)
-        #    - current_price > vwap                  (above VWAP)
-           - macd_line > macd_signal AND macd_hist > 0   (MACD bullish)
-           - 50 < rsi14 < 70                        (bullish momentum,
+        # #    - current_price > vwap                  (above VWAP)
+        #    - macd_line > macd_signal AND macd_hist > 0   (MACD bullish)
+        #    - 50 < rsi14 < 70                        (bullish momentum,
              not already overbought-extreme)
 
        SELL requires ALL of:
