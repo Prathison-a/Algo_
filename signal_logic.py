@@ -22,7 +22,7 @@ Decision path
        on top of it:
 
        BUY  requires ALL of:
-           - predicted_move_pct >  threshold_pct   (TCN bullish)
+        #    - predicted_move_pct >  threshold_pct   (TCN bullish)
            - ema9  > ema20 > ema50                 (EMA stack bullish)
         # #    - current_price > vwap                  (above VWAP)
         #    - macd_line > macd_signal AND macd_hist > 0   (MACD bullish)
