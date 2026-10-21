@@ -1,388 +1,388 @@
-"""
-signal_logic.py
-
-Converts the TCN model's classifier output into BUY / SELL / HOLD.
-
-Responsibility of this module (and ONLY this module):
-    Given the TCN classifier's prediction dict (signal, confidence,
-    probabilities, probability_margin, predicted_return, predicted_price),
-    decide the final, edge-triggered BUY / SELL / HOLD.
-
-This module NEVER trains or calls the TCN. It only consumes the
-prediction the model already produced. This keeps the trading logic
-fully swappable without ever touching the trained model.
-
-Decision path
---------------
-    1. model_signal = prediction["signal"]           ("BUY" / "SELL" / "HOLD")
-    2. If model_signal == "HOLD"                       -> final = HOLD
-       If confidence < MIN_CONFIDENCE                   -> final = HOLD
-       If probability_margin < MIN_PROBABILITY_MARGIN    -> final = HOLD
-       Otherwise                                         -> final = model_signal
-
-No EMA9/EMA20 crossover, predicted_next_open percentage move, or
-threshold_pct logic is used any more -- the classifier already decides
-direction; this module only decides whether to trust it enough to act.
-
-Edge-triggered signals
------------------------
-By default, the engine only emits BUY/SELL on the first candle a state
-becomes true, then HOLD for every candle after that (even if the raw
-condition is still true) until the opposite condition fires. This gives:
-
-    BUY -> HOLD -> HOLD -> ... -> SELL -> HOLD -> ... -> BUY ...
-
-instead of repeating BUY/SELL every candle the filtered condition happens
-to still hold. Set `SignalLogicConfig.edge_triggered = False` for the raw,
-non-deduped behavior.
-"""
-
-from __future__ import annotations
-
-import math
-from dataclasses import dataclass
-from enum import Enum
-from typing import Optional
-
-import pandas as pd
-
-
-class Signal(str, Enum):
-    BUY = "BUY"
-    SELL = "SELL"
-    HOLD = "HOLD"
-
-
-# Columns expected when feeding a DataFrame of TCN classifier predictions
-# (one row per bar) into SignalEngine.generate().
-REQUIRED_COLUMNS = (
-    "signal",
-    "confidence",
-    "probabilities",
-    "probability_margin",
-    "predicted_return",
-    "predicted_price",
-)
-
-
-@dataclass
-class SignalLogicConfig:
-    """
-    Tunable parameters. Nothing here touches the model -- safe to change
-    any time.
-    """
-
-    # Minimum classifier confidence required to act instead of HOLD.
-    min_confidence: float = 0.70
-
-    # Minimum probability margin (top class probability minus runner-up
-    # probability) required to act instead of HOLD.
-    min_probability_margin: float = 0.10
-
-    # If True (default), only emit BUY/SELL on the candle where the signal
-    # state actually changes; every other candle is HOLD. If False, BUY/SELL
-    # fires on every candle where the filtered condition holds.
-    edge_triggered: bool = True
-
-
-def _validate_columns(df: pd.DataFrame) -> None:
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        raise ValueError(
-            f"Signal logic input is missing required columns: {missing}. "
-            f"Expected at least: {REQUIRED_COLUMNS}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Validate a raw TCN prediction dict before it's used for signal generation.
-# ---------------------------------------------------------------------------
-
-def _validate_probability_value(name: str, value) -> None:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ValueError(f"{name} must be numeric, got {value!r}")
-    if math.isnan(value) or math.isinf(value):
-        raise ValueError(f"{name} must be finite (no NaN/Infinity), got {value!r}")
-    if not (0.0 <= value <= 1.0):
-        raise ValueError(f"{name} must be between 0 and 1, got {value!r}")
-
-
-def validate_model_signal(prediction: dict) -> dict:
-    """
-    Validates a raw TCN classifier prediction dict before it's trusted for
-    signal generation. Raises ValueError on anything malformed so a bad
-    model output can't silently turn into a wrong trade decision.
-
-    Checks:
-        - "signal" is one of BUY / HOLD / SELL
-        - "confidence" is numeric, finite, and in [0, 1]
-        - "probabilities" is a dict containing SELL / HOLD / BUY, each
-          numeric, finite, and in [0, 1]
-
-    Returns the same prediction dict unchanged if it passes.
-    """
-    signal = prediction.get("signal")
-    if signal not in (Signal.BUY.value, Signal.HOLD.value, Signal.SELL.value):
-        raise ValueError(f"Invalid signal: {signal!r}. Must be one of BUY/HOLD/SELL.")
-
-    _validate_probability_value("confidence", prediction.get("confidence"))
-
-    probabilities = prediction.get("probabilities")
-    if not isinstance(probabilities, dict):
-        raise ValueError("probabilities must be a dict with SELL/HOLD/BUY keys.")
-
-    required_keys = (Signal.SELL.value, Signal.HOLD.value, Signal.BUY.value)
-    missing = [k for k in required_keys if k not in probabilities]
-    if missing:
-        raise ValueError(f"probabilities is missing required keys: {missing}")
-
-    for key in required_keys:
-        _validate_probability_value(f"probabilities[{key}]", probabilities[key])
-
-    return prediction
-
-
-# ---------------------------------------------------------------------------
-# Edge-triggering: collapse repeated BUY/BUY/BUY... or SELL/SELL/SELL... runs
-# down to a single signal on the first candle of the run. A HOLD candle does
-# NOT reset the position state -- only an opposite BUY/SELL flips it.
-# ---------------------------------------------------------------------------
-
-def _dedupe_signal_transitions(
-    raw_signals: pd.Series, last_actionable: Optional[str] = None
-) -> tuple[pd.Series, Optional[str]]:
-    """
-    Example:
-        raw:    HOLD BUY BUY BUY HOLD SELL SELL BUY
-        result: HOLD BUY HOLD HOLD HOLD SELL HOLD BUY
-
-    `last_actionable` lets the dedupe continue across calls (e.g. live
-    bar-by-bar processing) instead of always starting fresh. Returns the
-    deduped series AND the updated last_actionable state, so a caller can
-    persist it between calls.
-    """
-    out = []
-
-    for value in raw_signals:
-        if value == Signal.HOLD.value:
-            out.append(Signal.HOLD.value)
-        elif value != last_actionable:
-            out.append(value)
-            last_actionable = value
-        else:
-            out.append(Signal.HOLD.value)
-
-    return pd.Series(out, index=raw_signals.index), last_actionable
-
-
-# ---------------------------------------------------------------------------
-# Strategy: filter the TCN classifier's own BUY/SELL/HOLD signal by
-# confidence and probability margin.
-# ---------------------------------------------------------------------------
-
-def classifier_filter_strategy(df: pd.DataFrame, config: SignalLogicConfig) -> pd.Series:
-    """
-    Rules (before edge-triggering):
-        model signal == "HOLD"                              -> HOLD
-        confidence < config.min_confidence                   -> HOLD
-        probability_margin < config.min_probability_margin    -> HOLD
-        otherwise                                             -> model signal
-    """
-    _validate_columns(df)
-
-    filtered = df["signal"].copy()
-
-    low_confidence = df["confidence"] < config.min_confidence
-    low_margin = df["probability_margin"] < config.min_probability_margin
-
-    filtered[low_confidence | low_margin] = Signal.HOLD.value
-    return filtered
-
-
-# ---------------------------------------------------------------------------
-# Engine
-# ---------------------------------------------------------------------------
-
-class SignalEngine:
-    """
-    Consumes TCN classifier predictions and turns them into edge-triggered
-    BUY/SELL/HOLD signals.
-
-    Usage (batch, over a DataFrame of predictions):
-        engine = SignalEngine()
-        result_df = engine.generate(df)
-        # df needs: signal, confidence, probabilities, probability_margin,
-        #           predicted_return, predicted_price
-
-    Usage (live, one prediction dict at a time):
-        engine = SignalEngine()
-        result = engine.process(prediction)
-        # prediction = {"signal": ..., "confidence": ..., "probabilities": ...,
-        #               "probability_margin": ..., "predicted_return": ...,
-        #               "predicted_price": ...}
-
-    Call engine.reset() to clear edge-trigger state (e.g. new session/day).
-    """
-
-    def __init__(
-        self,
-        strategy=classifier_filter_strategy,
-        config: Optional[SignalLogicConfig] = None,
-    ):
-        self.strategy = strategy
-        self.config = config or SignalLogicConfig()
-        self._last_actionable: Optional[str] = None
-
-    def reset(self) -> None:
-        """Clear edge-trigger state."""
-        self._last_actionable = None
-
-    def generate(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Returns a copy of df with:
-            - 'model_signal': the TCN classifier's raw signal, preserved
-            - 'signal'      : the final, edge-triggered BUY/SELL/HOLD
-        """
-        _validate_columns(df)
-        out = df.copy()
-        out["model_signal"] = out["signal"]
-
-        filtered = self.strategy(out, self.config)
-
-        if self.config.edge_triggered:
-            deduped, self._last_actionable = _dedupe_signal_transitions(
-                filtered, self._last_actionable
-            )
-            out["signal"] = deduped
-        else:
-            out["signal"] = filtered
-
-        return out
-
-    def process(self, prediction: dict) -> dict:
-        """
-        Live, one-prediction-at-a-time equivalent of generate(). Applies the
-        same confidence/probability-margin filters and edge-triggering.
-        """
-        model_signal = prediction["signal"]
-        confidence = prediction["confidence"]
-        probabilities = prediction["probabilities"]
-        probability_margin = prediction["probability_margin"]
-        predicted_return = prediction["predicted_return"]
-        predicted_price = prediction["predicted_price"]
-
-        if (
-            model_signal == Signal.HOLD.value
-            or confidence < self.config.min_confidence
-            or probability_margin < self.config.min_probability_margin
-        ):
-            filtered_signal = Signal.HOLD.value
-        else:
-            filtered_signal = model_signal
-
-        if self.config.edge_triggered:
-            if filtered_signal == Signal.HOLD.value:
-                final_signal = Signal.HOLD.value
-            elif filtered_signal != self._last_actionable:
-                final_signal = filtered_signal
-                self._last_actionable = filtered_signal
-            else:
-                final_signal = Signal.HOLD.value
-        else:
-            final_signal = filtered_signal
-
-        return {
-            "signal": final_signal,
-            "model_signal": model_signal,
-            "confidence": confidence,
-            "probabilities": probabilities,
-            "probability_margin": probability_margin,
-            "predicted_return": predicted_return,
-            "predicted_price": predicted_price,
-        }
-
-    def process_prediction(self, prediction: dict) -> dict:
-        """
-        Validates the raw TCN prediction (see validate_model_signal) and
-        then produces the edge-triggered signal via process(). The TCN's
-        classifier signal is authoritative -- BUY/HOLD/SELL is never
-        recalculated from EMA9/EMA20 or any other indicator.
-        """
-        validated = validate_model_signal(prediction)
-        return self.process(validated)
-
-
-# ---------------------------------------------------------------------------
-# Convert signals into Lightweight Charts markers
-# ---------------------------------------------------------------------------
-
-def to_lightweight_charts_markers(df: pd.DataFrame, time_column: str = "time") -> list[dict]:
-    """
-    Convert a DataFrame that already has a 'signal' column (from
-    SignalEngine.generate) into the marker format Lightweight Charts expects
-    for `series.setMarkers([...])`.
-
-    Only BUY and SELL rows produce markers; HOLD rows are skipped.
-    """
-    if "signal" not in df.columns:
-        raise ValueError("DataFrame must have a 'signal' column. Run SignalEngine.generate() first.")
-    if time_column not in df.columns:
-        raise ValueError(f"DataFrame must have a '{time_column}' column for chart timestamps.")
-
-    markers = []
-    for _, row in df.iterrows():
-        if row["signal"] == Signal.BUY.value:
-            markers.append(
-                {
-                    "time": row[time_column],
-                    "position": "belowBar",
-                    "color": "#26a69a",
-                    "shape": "arrowUp",
-                    "text": "BUY",
-                }
-            )
-        elif row["signal"] == Signal.SELL.value:
-            markers.append(
-                {
-                    "time": row[time_column],
-                    "position": "aboveBar",
-                    "color": "#ef5350",
-                    "shape": "arrowDown",
-                    "text": "SELL",
-                }
-            )
-    return markers
-
-
-# ---------------------------------------------------------------------------
-# Test: confirms edge-triggering matches the required transition table.
-# ---------------------------------------------------------------------------
-
-def _test_edge_triggering_matches_spec():
-    """
-    TCN output:     BUY BUY BUY HOLD HOLD SELL SELL BUY
-    Final output:   BUY HOLD HOLD HOLD HOLD SELL HOLD BUY
-    """
-    model_signals = ["BUY", "BUY", "BUY", "HOLD", "HOLD", "SELL", "SELL", "BUY"]
-    expected =       ["BUY", "HOLD", "HOLD", "HOLD", "HOLD", "SELL", "HOLD", "BUY"]
-
-    engine = SignalEngine()
-    actual = []
-    for sig in model_signals:
-        prediction = {
-            "signal": sig,
-            "confidence": 0.90,          # above MIN_CONFIDENCE (0.70) for every row
-            "probabilities": {"BUY": 0.90, "SELL": 0.05, "HOLD": 0.05},
-            "probability_margin": 0.80,  # above MIN_PROBABILITY_MARGIN (0.10) for every row
-            "predicted_return": 0.001,
-            "predicted_price": 100.0,
-        }
-        result = engine.process(prediction)
-        actual.append(result["signal"])
-
-    assert actual == expected, f"Edge-triggering mismatch.\nExpected: {expected}\nActual:   {actual}"
-    print("test_edge_triggering_matches_spec: PASS ->", actual)
-
-
-if __name__ == "__main__":
-    _test_edge_triggering_matches_spec()
+# """
+# signal_logic.py
+
+# Converts the TCN model's classifier output into BUY / SELL / HOLD.
+
+# Responsibility of this module (and ONLY this module):
+#     Given the TCN classifier's prediction dict (signal, confidence,
+#     probabilities, probability_margin, predicted_return, predicted_price),
+#     decide the final, edge-triggered BUY / SELL / HOLD.
+
+# This module NEVER trains or calls the TCN. It only consumes the
+# prediction the model already produced. This keeps the trading logic
+# fully swappable without ever touching the trained model.
+
+# Decision path
+# --------------
+#     1. model_signal = prediction["signal"]           ("BUY" / "SELL" / "HOLD")
+#     2. If model_signal == "HOLD"                       -> final = HOLD
+#        If confidence < MIN_CONFIDENCE                   -> final = HOLD
+#        If probability_margin < MIN_PROBABILITY_MARGIN    -> final = HOLD
+#        Otherwise                                         -> final = model_signal
+
+# No EMA9/EMA20 crossover, predicted_next_open percentage move, or
+# threshold_pct logic is used any more -- the classifier already decides
+# direction; this module only decides whether to trust it enough to act.
+
+# Edge-triggered signals
+# -----------------------
+# By default, the engine only emits BUY/SELL on the first candle a state
+# becomes true, then HOLD for every candle after that (even if the raw
+# condition is still true) until the opposite condition fires. This gives:
+
+#     BUY -> HOLD -> HOLD -> ... -> SELL -> HOLD -> ... -> BUY ...
+
+# instead of repeating BUY/SELL every candle the filtered condition happens
+# to still hold. Set `SignalLogicConfig.edge_triggered = False` for the raw,
+# non-deduped behavior.
+# """
+
+# from __future__ import annotations
+
+# import math
+# from dataclasses import dataclass
+# from enum import Enum
+# from typing import Optional
+
+# import pandas as pd
+
+
+# class Signal(str, Enum):
+#     BUY = "BUY"
+#     SELL = "SELL"
+#     HOLD = "HOLD"
+
+
+# # Columns expected when feeding a DataFrame of TCN classifier predictions
+# # (one row per bar) into SignalEngine.generate().
+# REQUIRED_COLUMNS = (
+#     "signal",
+#     "confidence",
+#     "probabilities",
+#     "probability_margin",
+#     "predicted_return",
+#     "predicted_price",
+# )
+
+
+# @dataclass
+# class SignalLogicConfig:
+#     """
+#     Tunable parameters. Nothing here touches the model -- safe to change
+#     any time.
+#     """
+
+#     # Minimum classifier confidence required to act instead of HOLD.
+#     min_confidence: float = 0.70
+
+#     # Minimum probability margin (top class probability minus runner-up
+#     # probability) required to act instead of HOLD.
+#     min_probability_margin: float = 0.10
+
+#     # If True (default), only emit BUY/SELL on the candle where the signal
+#     # state actually changes; every other candle is HOLD. If False, BUY/SELL
+#     # fires on every candle where the filtered condition holds.
+#     edge_triggered: bool = True
+
+
+# def _validate_columns(df: pd.DataFrame) -> None:
+#     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+#     if missing:
+#         raise ValueError(
+#             f"Signal logic input is missing required columns: {missing}. "
+#             f"Expected at least: {REQUIRED_COLUMNS}"
+#         )
+
+
+# # ---------------------------------------------------------------------------
+# # Validate a raw TCN prediction dict before it's used for signal generation.
+# # ---------------------------------------------------------------------------
+
+# def _validate_probability_value(name: str, value) -> None:
+#     if not isinstance(value, (int, float)) or isinstance(value, bool):
+#         raise ValueError(f"{name} must be numeric, got {value!r}")
+#     if math.isnan(value) or math.isinf(value):
+#         raise ValueError(f"{name} must be finite (no NaN/Infinity), got {value!r}")
+#     if not (0.0 <= value <= 1.0):
+#         raise ValueError(f"{name} must be between 0 and 1, got {value!r}")
+
+
+# def validate_model_signal(prediction: dict) -> dict:
+#     """
+#     Validates a raw TCN classifier prediction dict before it's trusted for
+#     signal generation. Raises ValueError on anything malformed so a bad
+#     model output can't silently turn into a wrong trade decision.
+
+#     Checks:
+#         - "signal" is one of BUY / HOLD / SELL
+#         - "confidence" is numeric, finite, and in [0, 1]
+#         - "probabilities" is a dict containing SELL / HOLD / BUY, each
+#           numeric, finite, and in [0, 1]
+
+#     Returns the same prediction dict unchanged if it passes.
+#     """
+#     signal = prediction.get("signal")
+#     if signal not in (Signal.BUY.value, Signal.HOLD.value, Signal.SELL.value):
+#         raise ValueError(f"Invalid signal: {signal!r}. Must be one of BUY/HOLD/SELL.")
+
+#     _validate_probability_value("confidence", prediction.get("confidence"))
+
+#     probabilities = prediction.get("probabilities")
+#     if not isinstance(probabilities, dict):
+#         raise ValueError("probabilities must be a dict with SELL/HOLD/BUY keys.")
+
+#     required_keys = (Signal.SELL.value, Signal.HOLD.value, Signal.BUY.value)
+#     missing = [k for k in required_keys if k not in probabilities]
+#     if missing:
+#         raise ValueError(f"probabilities is missing required keys: {missing}")
+
+#     for key in required_keys:
+#         _validate_probability_value(f"probabilities[{key}]", probabilities[key])
+
+#     return prediction
+
+
+# # ---------------------------------------------------------------------------
+# # Edge-triggering: collapse repeated BUY/BUY/BUY... or SELL/SELL/SELL... runs
+# # down to a single signal on the first candle of the run. A HOLD candle does
+# # NOT reset the position state -- only an opposite BUY/SELL flips it.
+# # ---------------------------------------------------------------------------
+
+# def _dedupe_signal_transitions(
+#     raw_signals: pd.Series, last_actionable: Optional[str] = None
+# ) -> tuple[pd.Series, Optional[str]]:
+#     """
+#     Example:
+#         raw:    HOLD BUY BUY BUY HOLD SELL SELL BUY
+#         result: HOLD BUY HOLD HOLD HOLD SELL HOLD BUY
+
+#     `last_actionable` lets the dedupe continue across calls (e.g. live
+#     bar-by-bar processing) instead of always starting fresh. Returns the
+#     deduped series AND the updated last_actionable state, so a caller can
+#     persist it between calls.
+#     """
+#     out = []
+
+#     for value in raw_signals:
+#         if value == Signal.HOLD.value:
+#             out.append(Signal.HOLD.value)
+#         elif value != last_actionable:
+#             out.append(value)
+#             last_actionable = value
+#         else:
+#             out.append(Signal.HOLD.value)
+
+#     return pd.Series(out, index=raw_signals.index), last_actionable
+
+
+# # ---------------------------------------------------------------------------
+# # Strategy: filter the TCN classifier's own BUY/SELL/HOLD signal by
+# # confidence and probability margin.
+# # ---------------------------------------------------------------------------
+
+# def classifier_filter_strategy(df: pd.DataFrame, config: SignalLogicConfig) -> pd.Series:
+#     """
+#     Rules (before edge-triggering):
+#         model signal == "HOLD"                              -> HOLD
+#         confidence < config.min_confidence                   -> HOLD
+#         probability_margin < config.min_probability_margin    -> HOLD
+#         otherwise                                             -> model signal
+#     """
+#     _validate_columns(df)
+
+#     filtered = df["signal"].copy()
+
+#     low_confidence = df["confidence"] < config.min_confidence
+#     low_margin = df["probability_margin"] < config.min_probability_margin
+
+#     filtered[low_confidence | low_margin] = Signal.HOLD.value
+#     return filtered
+
+
+# # ---------------------------------------------------------------------------
+# # Engine
+# # ---------------------------------------------------------------------------
+
+# class SignalEngine:
+#     """
+#     Consumes TCN classifier predictions and turns them into edge-triggered
+#     BUY/SELL/HOLD signals.
+
+#     Usage (batch, over a DataFrame of predictions):
+#         engine = SignalEngine()
+#         result_df = engine.generate(df)
+#         # df needs: signal, confidence, probabilities, probability_margin,
+#         #           predicted_return, predicted_price
+
+#     Usage (live, one prediction dict at a time):
+#         engine = SignalEngine()
+#         result = engine.process(prediction)
+#         # prediction = {"signal": ..., "confidence": ..., "probabilities": ...,
+#         #               "probability_margin": ..., "predicted_return": ...,
+#         #               "predicted_price": ...}
+
+#     Call engine.reset() to clear edge-trigger state (e.g. new session/day).
+#     """
+
+#     def __init__(
+#         self,
+#         strategy=classifier_filter_strategy,
+#         config: Optional[SignalLogicConfig] = None,
+#     ):
+#         self.strategy = strategy
+#         self.config = config or SignalLogicConfig()
+#         self._last_actionable: Optional[str] = None
+
+#     def reset(self) -> None:
+#         """Clear edge-trigger state."""
+#         self._last_actionable = None
+
+#     def generate(self, df: pd.DataFrame) -> pd.DataFrame:
+#         """
+#         Returns a copy of df with:
+#             - 'model_signal': the TCN classifier's raw signal, preserved
+#             - 'signal'      : the final, edge-triggered BUY/SELL/HOLD
+#         """
+#         _validate_columns(df)
+#         out = df.copy()
+#         out["model_signal"] = out["signal"]
+
+#         filtered = self.strategy(out, self.config)
+
+#         if self.config.edge_triggered:
+#             deduped, self._last_actionable = _dedupe_signal_transitions(
+#                 filtered, self._last_actionable
+#             )
+#             out["signal"] = deduped
+#         else:
+#             out["signal"] = filtered
+
+#         return out
+
+#     def process(self, prediction: dict) -> dict:
+#         """
+#         Live, one-prediction-at-a-time equivalent of generate(). Applies the
+#         same confidence/probability-margin filters and edge-triggering.
+#         """
+#         model_signal = prediction["signal"]
+#         confidence = prediction["confidence"]
+#         probabilities = prediction["probabilities"]
+#         probability_margin = prediction["probability_margin"]
+#         predicted_return = prediction["predicted_return"]
+#         predicted_price = prediction["predicted_price"]
+
+#         if (
+#             model_signal == Signal.HOLD.value
+#             or confidence < self.config.min_confidence
+#             or probability_margin < self.config.min_probability_margin
+#         ):
+#             filtered_signal = Signal.HOLD.value
+#         else:
+#             filtered_signal = model_signal
+
+#         if self.config.edge_triggered:
+#             if filtered_signal == Signal.HOLD.value:
+#                 final_signal = Signal.HOLD.value
+#             elif filtered_signal != self._last_actionable:
+#                 final_signal = filtered_signal
+#                 self._last_actionable = filtered_signal
+#             else:
+#                 final_signal = Signal.HOLD.value
+#         else:
+#             final_signal = filtered_signal
+
+#         return {
+#             "signal": final_signal,
+#             "model_signal": model_signal,
+#             "confidence": confidence,
+#             "probabilities": probabilities,
+#             "probability_margin": probability_margin,
+#             "predicted_return": predicted_return,
+#             "predicted_price": predicted_price,
+#         }
+
+#     def process_prediction(self, prediction: dict) -> dict:
+#         """
+#         Validates the raw TCN prediction (see validate_model_signal) and
+#         then produces the edge-triggered signal via process(). The TCN's
+#         classifier signal is authoritative -- BUY/HOLD/SELL is never
+#         recalculated from EMA9/EMA20 or any other indicator.
+#         """
+#         validated = validate_model_signal(prediction)
+#         return self.process(validated)
+
+
+# # ---------------------------------------------------------------------------
+# # Convert signals into Lightweight Charts markers
+# # ---------------------------------------------------------------------------
+
+# def to_lightweight_charts_markers(df: pd.DataFrame, time_column: str = "time") -> list[dict]:
+#     """
+#     Convert a DataFrame that already has a 'signal' column (from
+#     SignalEngine.generate) into the marker format Lightweight Charts expects
+#     for `series.setMarkers([...])`.
+
+#     Only BUY and SELL rows produce markers; HOLD rows are skipped.
+#     """
+#     if "signal" not in df.columns:
+#         raise ValueError("DataFrame must have a 'signal' column. Run SignalEngine.generate() first.")
+#     if time_column not in df.columns:
+#         raise ValueError(f"DataFrame must have a '{time_column}' column for chart timestamps.")
+
+#     markers = []
+#     for _, row in df.iterrows():
+#         if row["signal"] == Signal.BUY.value:
+#             markers.append(
+#                 {
+#                     "time": row[time_column],
+#                     "position": "belowBar",
+#                     "color": "#26a69a",
+#                     "shape": "arrowUp",
+#                     "text": "BUY",
+#                 }
+#             )
+#         elif row["signal"] == Signal.SELL.value:
+#             markers.append(
+#                 {
+#                     "time": row[time_column],
+#                     "position": "aboveBar",
+#                     "color": "#ef5350",
+#                     "shape": "arrowDown",
+#                     "text": "SELL",
+#                 }
+#             )
+#     return markers
+
+
+# # ---------------------------------------------------------------------------
+# # Test: confirms edge-triggering matches the required transition table.
+# # ---------------------------------------------------------------------------
+
+# def _test_edge_triggering_matches_spec():
+#     """
+#     TCN output:     BUY BUY BUY HOLD HOLD SELL SELL BUY
+#     Final output:   BUY HOLD HOLD HOLD HOLD SELL HOLD BUY
+#     """
+#     model_signals = ["BUY", "BUY", "BUY", "HOLD", "HOLD", "SELL", "SELL", "BUY"]
+#     expected =       ["BUY", "HOLD", "HOLD", "HOLD", "HOLD", "SELL", "HOLD", "BUY"]
+
+#     engine = SignalEngine()
+#     actual = []
+#     for sig in model_signals:
+#         prediction = {
+#             "signal": sig,
+#             "confidence": 0.90,          # above MIN_CONFIDENCE (0.70) for every row
+#             "probabilities": {"BUY": 0.90, "SELL": 0.05, "HOLD": 0.05},
+#             "probability_margin": 0.80,  # above MIN_PROBABILITY_MARGIN (0.10) for every row
+#             "predicted_return": 0.001,
+#             "predicted_price": 100.0,
+#         }
+#         result = engine.process(prediction)
+#         actual.append(result["signal"])
+
+#     assert actual == expected, f"Edge-triggering mismatch.\nExpected: {expected}\nActual:   {actual}"
+#     print("test_edge_triggering_matches_spec: PASS ->", actual)
+
+
+# if __name__ == "__main__":
+#     _test_edge_triggering_matches_spec()
